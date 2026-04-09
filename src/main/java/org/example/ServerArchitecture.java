@@ -1,42 +1,86 @@
 package org.example;
 
 // =============================================================
-// Production-Ready Architecture
-// The final, most complete version. Adds:
+// PRODUCTION-READY HTTP SERVER ARCHITECTURE (FINAL)
 //
-//   1. BasicAuth Filter  — intercepts ALL requests before
-//      they reach any handler (Chain of Responsibility pattern).
-//      Checks the "Authorization: Basic <base64>" header.
+// CORE ARCHITECTURE
 //
-//   2. Cache-Control Headers — demonstrates the caching concepts
-//      from Week 3: private, public, no-store.
+//   Request → [AuthFilter] → [MethodFilter] → [Handler] → Response
+//                │               │
+//                │               └── Rejects invalid HTTP methods (405)
+//                └── Rejects unauthenticated requests (401)
 //
-//   3. Router pattern — centralised context registration keeps
-//      main() clean and makes adding routes easy.
+// Filters implement a Chain of Responsibility pattern.
+// Each filter decides whether to pass the request forward.
 //
-//   4. Graceful shutdown — shuts down the thread pool properly.
+// -------------------------------------------------------------
+// INCLUDED FEATURES
 //
-// Architecture :
+// 1. Basic Authentication (AuthFilter)
+//    - Uses HTTP Basic Auth header
+//    - Credentials loaded from environment variables
+//      (APP_USER / APP_PASS)
+//    - Server fails fast if missing
 //
-//   Request → [AuthFilter] → [Handler] → Response
-//                  ↑ rejects with 401 if credentials wrong
+// 2. Method Enforcement (MethodFilter)
+//    - Centralised HTTP method validation (GET, POST)
+//    - Removes duplicate logic from handlers
 //
-// To test with curl:
-//   curl -u admin:secret http://localhost:8000/hello
-//   curl -u admin:secret "http://localhost:8000/greet?name=Alice"
-//   curl -u admin:secret -X POST http://localhost:8000/echo -d '{"key":"val"}'
+// 3. Cache-Control Policies
+//    - PUBLIC   → cacheable by CDN/proxies
+//    - PRIVATE  → browser-only caching
+//    - NO_STORE → never cached (sensitive data)
+//
+// 4. Safe JSON Handling (Gson)
+//    - Prevents malformed JSON from string concatenation
+//    - Automatically escapes special characters
+//
+// 5. URL Query Decoding
+//    - Proper handling of encoded params (?name=John%20Doe)
+//
+// 6. Request Size Protection
+//    - POST body limit (10 KB)
+//    - Prevents memory abuse / DoS risks
+//
+// 7. Thread Pool (ExecutorService)
+//    - Cached pool for I/O-bound concurrency
+//
+// 8. Graceful Shutdown
+//    - Allows in-flight requests to complete
+//
+// 9. Centralised Routing
+//    - registerRoute() keeps main() clean and extensible
+//
+// -------------------------------------------------------------
+// HOW TO RUN
+//cc
+// export APP_USER=admin
+// export APP_PASS=secret
+//
+// javac -cp .:gson-2.10.1.jar ServerArchitecture.java
+// java  -cp .:gson-2.10.1.jar org.example.ServerArchitecture
+//
+// -------------------------------------------------------------
+// TESTING
+//
+// curl -u admin:secret http://localhost:8000/hello
+// curl -u admin:secret "http://localhost:8000/greet?name=John%20Doe"
+// curl -u admin:secret -X POST http://localhost:8000/echo -d '{"key":"val"}'
+//
 // =============================================================
 
+import com.google.gson.Gson;
 import com.sun.net.httpserver.*;
 
 import java.io.IOException;
-import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.InetSocketAddress;
+import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
 import java.util.Base64;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.Optional;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.logging.Level;
@@ -44,58 +88,83 @@ import java.util.logging.Logger;
 
 public class ServerArchitecture {
 
-    private static final Logger Log = Logger.getLogger(ServerArchitecture.class.getName());
+    private static final Logger log = Logger.getLogger(ServerArchitecture.class.getName());
     private static final int PORT = 8000;
+
+    // Maximum allowed request body size (10 KB)
+    // Protects server from large payload attacks
+    static final int MAX_BODY_BYTES = 10_000;
+
+    // Shared Gson instance (thread-safe for serialization)
+    static final Gson GSON = new Gson();
 
     public static void main(String[] args) {
 
-        try{
+        // ------------------------------------------------------
+        // Load credentials from environment variables
+        // Fail fast if not provided (secure default)
+        // ------------------------------------------------------
+        String appUser = System.getenv("APP_USER");
+        String appPass = System.getenv("APP_PASS");
+
+        if (appUser == null || appUser.isBlank()) {
+            log.severe("APP_USER environment variable is not set.");
+            System.exit(1);
+        }
+        if (appPass == null || appPass.isBlank()) {
+            log.severe("APP_PASS environment variable is not set.");
+            System.exit(1);
+        }
+
+        try {
             HttpServer server = HttpServer.create(new InetSocketAddress(PORT), 0);
 
-            // --- Thread pool: cached for I/O-bound work ---
+            // Thread pool for concurrent request handling
             ExecutorService pool = Executors.newCachedThreadPool();
             server.setExecutor(pool);
 
-            // --- Register routes and attach the Auth filter to each context ---
-            AuthFilter auth = new AuthFilter("admin", "secret");
-            registerRoute(server, "/hello", new HelloHandler(), auth);
-            registerRoute(server, "/greet", new GreetHandler(), auth);
-            registerRoute(server, "/echo", new EchoHandler(), auth);
+            // Filters applied in order: Auth → Method
+            AuthFilter auth = new AuthFilter(appUser, appPass);
 
-            // Graceful shutdown hook on Ctrl+C
+            registerRoute(server, "/hello", new HelloHandler(), auth, new MethodFilter("GET"));
+            registerRoute(server, "/greet", new GreetHandler(), auth, new MethodFilter("GET"));
+            registerRoute(server, "/echo",  new EchoHandler(),  auth, new MethodFilter("POST"));
+
+            // Graceful shutdown hook
             Runtime.getRuntime().addShutdownHook(new Thread(() -> {
-                Log.info("Shutting down server...");
-                server.stop(2); // allow 2s for in-flight requests to finish
+                log.info("Shutting down server...");
+                server.stop(2);
                 pool.shutdown();
-                Log.info("Server stopped");
+                log.info("Server stopped.");
             }));
 
             server.start();
-            Log.info("Server running on http:/localhost:" + PORT);
-            Log.info("Credentials required - username: admin password: secret");
-        }
-        catch(IOException e) {
-            Log.log(Level.SEVERE, "Sever could not start", e);
+            log.info("Server running on http://localhost:" + PORT);
+
+        } catch (IOException e) {
+            log.log(Level.SEVERE, "Server could not start", e);
         }
     }
 
-    // Registers a context and attaches a filter to it
-    private static void registerRoute(HttpServer server, String path, HttpHandler handler, Filter filter) {
+    // Registers a route and attaches filters in execution order
+    private static void registerRoute(HttpServer server, String path,
+                                      HttpHandler handler, Filter... filters) {
         HttpContext ctx = server.createContext(path, handler);
-        ctx.getFilters().add(filter);
-        Log.info("Registered route: " + path);
+        for (Filter f : filters) {
+            ctx.getFilters().add(f);
+        }
+        log.info("Registered route: " + path);
     }
 
     // ===========================================================
-    //  FILTER: Basic Authentication
-    //  Runs BEFORE the handler. Returns 401 if credentials fail.
-    //  Week 3: "Each request must be self-descriptive, containing
-    //           all necessary authentication."
+    // FILTER: Basic Authentication
+    //
+    // Validates "Authorization: Basic <base64>" header
+    // Rejects unauthenticated requests with 401
     // ===========================================================
 
     static class AuthFilter extends Filter {
 
-        private static final Logger Log = Logger.getLogger(AuthFilter.class.getName());
         private final String expectedUsername;
         private final String expectedPassword;
 
@@ -113,192 +182,186 @@ public class ServerArchitecture {
         public void doFilter(HttpExchange exchange, Chain chain) throws IOException {
 
             String authHeader = exchange.getRequestHeaders().getFirst("Authorization");
-            // No credentials provided at all
-            if(authHeader == null || !authHeader.startsWith("Basic")) {
 
-                Log.warning("Unathorized request (no credentials): " + exchange.getRequestURI() + " from " + exchange.getRemoteAddress());
+            if (authHeader == null || !authHeader.startsWith("Basic")) {
                 rejectUnauthorized(exchange);
-                return; // do NOT call chain.doFilter — block the request here
+                return;
             }
 
             try {
-                // Decode Base64: "Basic YWRtaW46c2VjcmV0" -> "admin:secret"
-                String base64 = authHeader.substring("Basic ".length());
-                String decoded = new String(Base64.getDecoder().decode(base64),
+                String decoded = new String(
+                        Base64.getDecoder().decode(authHeader.substring(6)),
                         StandardCharsets.UTF_8);
+
                 String[] parts = decoded.split(":", 2);
 
-                if(parts.length != 2
-                        || !parts[0].equals(expectedUsername)
-                        || !parts[1].equals(expectedPassword)) {
-                    Log.warning("Bad credentials for user: " + (parts.length > 0 ? parts[0] : "?") + " on " + exchange.getRequestURI());
+                if (parts.length != 2 ||
+                        !parts[0].equals(expectedUsername) ||
+                        !parts[1].equals(expectedPassword)) {
                     rejectUnauthorized(exchange);
                     return;
                 }
 
-                // Credentials valid — pass request to the actual handler
-                Log.info("Authenticated user: " + parts[0] + " accessing " + exchange.getRequestURI());
                 chain.doFilter(exchange);
 
-            }catch(IllegalArgumentException e) {
-                // Base64 decoding failed (malformed header)
-                Log.log(Level.WARNING, "Malformed Authorization header", e);
+            } catch (IllegalArgumentException e) {
                 rejectUnauthorized(exchange);
             }
-
         }
 
         private void rejectUnauthorized(HttpExchange exchange) throws IOException {
-            // WWW-Authenticate header tells the browser to show a login prompt
             exchange.getResponseHeaders().set("WWW-Authenticate", "Basic realm=\"SecureApp\"");
             byte[] body = "401 Unauthorized".getBytes(StandardCharsets.UTF_8);
             exchange.sendResponseHeaders(401, body.length);
-            OutputStream out = exchange.getResponseBody();
-            out.write(body);
-            out.close();
+            try (OutputStream out = exchange.getResponseBody()) {
+                out.write(body);
+            }
         }
     }
 
     // ===========================================================
-    //  HANDLER 1: GET /hello
-    //  Returns plain text. Uses "private" cache-control (user data).
+    // FILTER: HTTP Method Enforcement
+    //
+    // Ensures only allowed HTTP methods reach the handler
+    // Eliminates duplicate checks inside handlers
+    // ===========================================================
+
+    static class MethodFilter extends Filter {
+
+        private final String allowedMethod;
+
+        MethodFilter(String allowedMethod) {
+            this.allowedMethod = allowedMethod.toUpperCase();
+        }
+
+        @Override
+        public String description() {
+            return "HTTP Method Filter";
+        }
+
+        @Override
+        public void doFilter(HttpExchange exchange, Chain chain) throws IOException {
+            if (!exchange.getRequestMethod().equalsIgnoreCase(allowedMethod)) {
+                exchange.getResponseHeaders().set("Allow", allowedMethod);
+                byte[] body = ("405 Method Not Allowed — use " + allowedMethod)
+                        .getBytes(StandardCharsets.UTF_8);
+                exchange.sendResponseHeaders(405, body.length);
+                try (OutputStream out = exchange.getResponseBody()) {
+                    out.write(body);
+                }
+                return;
+            }
+            chain.doFilter(exchange);
+        }
+    }
+
+    // ===========================================================
+    // HANDLER: /hello (GET)
+    //
+    // Returns plain text
+    // Cache: PRIVATE (user-specific response)
     // ===========================================================
 
     static class HelloHandler implements HttpHandler {
-
-        private static final Logger Log = Logger.getLogger(HelloHandler.class.getName());
-
-        @Override
         public void handle(HttpExchange exchange) throws IOException {
-            Log.info("GET /hello");
-            try {
-                if(!"GET".equalsIgnoreCase(exchange.getRequestMethod())) {
-                    sendResponse(exchange, 405, "text/plain", "405 Method Not Allowed", CachePolicy.NO_STORE);
-                    return;
-                }
-                // private: only the user's browser may cache, not shared proxies
-                sendResponse(exchange, 200, "text/plain", "Hello! You are authenticated.", CachePolicy.PRIVATE);
-
-            }catch(Exception e) {
-                Log.log(Level.SEVERE, "Error in HelloHandler", e);
-                sendResponse(exchange,500,"text/plain", "500 Internal Server Error", CachePolicy.NO_STORE);
-            }
+            sendResponse(exchange, 200, "text/plain",
+                    "Hello! You are authenticated.", CachePolicy.PRIVATE);
         }
     }
 
     // ===========================================================
-    //  HANDLER 2: GET /greet?name=Alice
-    //  Returns JSON. Public cacheable (no user-specific data).
+    // HANDLER: /greet (GET)
+    //
+    // Returns JSON greeting
+    // Cache: PUBLIC (safe to cache)
     // ===========================================================
 
     static class GreetHandler implements HttpHandler {
-
-        private static final Logger Log = Logger.getLogger(GreetHandler.class.getName());
-
-        @Override
         public void handle(HttpExchange exchange) throws IOException {
-            Log.info("GET /greet");
+            Map<String, String> params = parseQuery(exchange.getRequestURI().getQuery());
+            String name = params.getOrDefault("name", "Stranger");
 
-            try {
-                if(!"GET".equalsIgnoreCase(exchange.getRequestMethod())) {
-                    sendResponse(exchange, 405, "application/json", "{\"error\":\"Method Not Allowed\"}", CachePolicy.NO_STORE);
-                    return;
-                }
-
-                Map<String, String> params = parseQuery(exchange.getRequestURI().getQuery());
-
-                String name = params.getOrDefault("name", "Stranger");
-
-                String json = "{\"message\":\"Hello, " + name + "!\",\"status\":\"ok\"}";
-
-                // public: a shared CDN/proxy may cache this (non-sensitive data)
-                sendResponse(exchange, 200, "application/json", json, CachePolicy.PUBLIC);
-            }
-            catch(Exception e) {
-                Log.log(Level.SEVERE, "Error in GreetHandler", e);
-                sendResponse(exchange, 500, "application/json", "{\"error\":\"Internal Server Error\"}", CachePolicy.NO_STORE);
-            }
+            sendResponse(exchange, 200, "application/json",
+                    GSON.toJson(Map.of("message", "Hello, " + name + "!", "status", "ok")),
+                    CachePolicy.PUBLIC);
         }
     }
 
     // ===========================================================
-    //  HANDLER 3: POST /echo
-    //  Reads the request body and echoes it back as JSON.
-    //  no-store: body may contain sensitive input, never cache.
+    // HANDLER: /echo (POST)
+    //
+    // Echoes request body safely
+    // Cache: NO_STORE (sensitive data)
     // ===========================================================
 
     static class EchoHandler implements HttpHandler {
-        private static final Logger Log = Logger.getLogger(EchoHandler.class.getName());
-
-        @Override
         public void handle(HttpExchange exchange) throws IOException {
-            Log.info("POST /echo");
-            try {
-                if (!"POST".equalsIgnoreCase(exchange.getRequestMethod())) {
-                    sendResponse(exchange, 405, "application/json",
-                            "{\"error\":\"Method Not Allowed — use POST\"}",
-                            CachePolicy.NO_STORE);
-                    return;
-                }
 
-                // Read the full request body
-                InputStream in = exchange.getRequestBody();
-                String body = new String(in.readAllBytes(), StandardCharsets.UTF_8);
-                Log.info("Echo received body: " + body);
+            long contentLength = Optional.ofNullable(
+                            exchange.getRequestHeaders().getFirst("Content-Length"))
+                    .map(Long::parseLong).orElse(-1L);
 
-                String json = "{\"echo\":" + (body.isEmpty() ? "\"(empty)\"" : body) + "}";
-
-                // no-store: banking / sensitive POST data must never be cached
-                sendResponse(exchange, 200, "application/json", json, CachePolicy.NO_STORE);
-
-            } catch (Exception e) {
-                Log.log(Level.SEVERE, "Error in EchoHandler", e);
-                sendResponse(exchange, 500, "application/json",
-                        "{\"error\":\"Internal Server Error\"}", CachePolicy.NO_STORE);
+            if (contentLength > MAX_BODY_BYTES) {
+                sendResponse(exchange, 413, "application/json",
+                        GSON.toJson(Map.of("error", "Payload too large")),
+                        CachePolicy.NO_STORE);
+                return;
             }
+
+            byte[] bodyBytes = exchange.getRequestBody().readNBytes(MAX_BODY_BYTES + 1);
+
+            if (bodyBytes.length > MAX_BODY_BYTES) {
+                sendResponse(exchange, 413, "application/json",
+                        GSON.toJson(Map.of("error", "Payload too large")),
+                        CachePolicy.NO_STORE);
+                return;
+            }
+
+            String body = new String(bodyBytes, StandardCharsets.UTF_8);
+
+            sendResponse(exchange, 200, "application/json",
+                    GSON.toJson(Map.of("echo", body.isEmpty() ? "(empty)" : body)),
+                    CachePolicy.NO_STORE);
         }
     }
-
-    // ===========================================================
-    //  Cache Policy Enum (Week 3: Cache-Control header values)
-    // ===========================================================
 
     enum CachePolicy {
-        PUBLIC("public, max-age=3600"),     // shared proxy/CDN cachable (1 hour)
-        PRIVATE("private, max-age=600"),    // Browser-only cache (10 min)
-        NO_STORE("no-store");               // Never Cache (sensitive data)
+        PUBLIC("public, max-age=3600"),
+        PRIVATE("private, max-age=600"),
+        NO_STORE("no-store");
 
         final String headerValue;
+        CachePolicy(String v) { this.headerValue = v; }
+    }
 
-        CachePolicy(String headerValue) {
-            this.headerValue = headerValue;
+    // Shared response builder
+    static void sendResponse(HttpExchange exchange, int status,
+                             String contentType, String body,
+                             CachePolicy cache) throws IOException {
+        byte[] bytes = body.getBytes(StandardCharsets.UTF_8);
+        exchange.getResponseHeaders().set("Content-Type", contentType);
+        exchange.getResponseHeaders().set("Cache-Control", cache.headerValue);
+        exchange.sendResponseHeaders(status, bytes.length);
+        try (OutputStream out = exchange.getResponseBody()) {
+            out.write(bytes);
         }
     }
 
-    // ===========================================================
-    //  Shared Utilities
-    // ===========================================================
-
-    static void sendResponse(HttpExchange exchange, int status, String contentType, String body, CachePolicy cache) throws IOException {
-
-        byte[] bytes = body.getBytes(StandardCharsets.UTF_8);
-        exchange.getResponseHeaders().set("Content-Type",contentType + "; charset=UTF-8");
-        exchange.getResponseHeaders().set("Cache-Control", cache.headerValue);
-        exchange.sendResponseHeaders(status, bytes.length);
-        OutputStream out = exchange.getResponseBody();
-        out.write(bytes);
-        out.close();
-    }
-
+    // Parses and URL-decodes query parameters
     static Map<String, String> parseQuery(String query) {
         Map<String, String> result = new HashMap<>();
+        if (query == null) return result;
 
-        if(query == null || query.isEmpty()) return result;
-        for(String param : query.split("&")) {
+        for (String param : query.split("&")) {
             String[] parts = param.split("=", 2);
-            result.put(parts[0], parts.length == 2 ? parts[1] : "");
+            try {
+                String key = URLDecoder.decode(parts[0], StandardCharsets.UTF_8);
+                String value = parts.length == 2
+                        ? URLDecoder.decode(parts[1], StandardCharsets.UTF_8)
+                        : "";
+                result.put(key, value);
+            } catch (IllegalArgumentException ignored) {}
         }
         return result;
     }
-
 }
