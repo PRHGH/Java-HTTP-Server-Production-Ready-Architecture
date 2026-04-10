@@ -1,391 +1,681 @@
 package org.example;
 
 // =============================================================
-// PRODUCTION-READY HTTP SERVER (FINAL)
-// =============================================================
+// STAGE 4 — Level 3: Architectural Upgrades
+// Builds on all Level 1 improvements. Adds:
 //
-// ARCHITECTURE
+//   1. Router
+//      Centralised route registry mapping (method + path pattern)
+//      to handlers. Supports path parameters (/users/{id}).
+//      Automatically returns 404 for unknown paths and 405 when
+//      the path exists but the method doesn't match.
 //
-//   Request → [RequestLogger] → [AuthFilter] → [MethodFilter] → [Handler] → Response
-//                │                 │
-//                │                 └── Rejects invalid HTTP methods (405)
-//                └── Rejects unauthenticated requests (401)
+//   2. HTTPS / TLS
+//      Switches from HttpServer to HttpsServer. Loads a keys0tore
+//      (self-signed certificate) and wraps the server in SSLContext.
+//      Basic Auth credentials are no longer transmitted in plaintext.
 //
-//   Filters implement a Chain of Responsibility pattern.
-//   Each filter decides whether to pass the request forward.
+//   3. JWT Authentication
+//      Replaces Basic Auth. A POST /login endpoint exchanges
+//      username + password for a signed JWT token (HS256).
+//      All protected routes verify the token via JwtFilter.
+//      Tokens expire after 1 hour. No session state on the server.
 //
-// FEATURES
+// Architecture:
 //
-// 1. Basic Authentication (AuthFilter)
-//    - HTTP Basic Auth using APP_USER / APP_PASS from environment
-//    - Server fails fast if missing
+//   HTTPS Request
+//         │
+//         ▼
+//    [TLS Layer]       ← decrypts the connection
+//         │
+//         ▼
+//      [Router]        ← matches path/method, extracts {params}
+//         │
+//         ▼
+//    [JwtFilter]       ← verifies token signature + expiry
+//         │              /login is exempt from this filter
+//         ▼
+//     [Handler]        ← only sees valid authenticated requests
 //
-// 2. Method Enforcement (MethodFilter)
-//    - Centralised HTTP method validation (GET, POST)
-//    - Reduces duplicate checks in handlers
+// Setup (one-time):
+//   keytool -genkeypair -alias server -keyalg RSA -keysize 2048  \
+//           -validity 365 -keystore keystore.jks                 \
+//           -storepass changeit -keypass changeit                \
+//           -dname "CN=localhost"
 //
-// 3. Request Logging (RequestLogger)
-//    - Logs method, path, elapsed time (ms), request number
-//    - Increments shared AtomicLong REQUEST_COUNTER
+// Environment variables required:
+//   APP_USER=admin
+//   APP_PASS=secret
+//   JWT_SECRET=a-long-random-string-at-least-32-chars
+//   KEYSTORE_PASS=changeit          (matches keytool -storepass)
 //
-// 4. Status Endpoint (/status, no auth)
-//    - Returns JSON with uptime, total requests, and port
-//    - Cache: NO_STORE
-//
-// 5. Static File Serving (/files, auth required)
-//    - Serves files from ./public
-//    - Path traversal prevention (normalizes paths, checks startsWith root)
-//    - Detects MIME type via Files.probeContentType
-//    - Cache: PUBLIC
-//
-// 6. Handlers (/hello, /greet, /echo)
-//    - /hello: plain text, Cache: PRIVATE
-//    - /greet: JSON greeting, Cache: PUBLIC
-//    - /echo: echoes POST body, Cache: NO_STORE
-//
-// 7. Safe JSON handling with Gson
-//
-// 8. URL query decoding
-//
-// 9. Request size protection (10 KB limit)
-//
-// 10. Thread pool for concurrency
-//
-// 11. Graceful shutdown
-//
-// RUNNING
-//   export APP_USER=admin
-//   export APP_PASS=secret
-//   mkdir public && echo "Hello from file" > public/hello.txt
+// Run:
 //   javac -cp .:gson-2.10.1.jar ServerArchitecture.java
-//   java -cp .:gson-2.10.1.jar org.example.ServerArchitecture
+//   java  -cp .:gson-2.10.1.jar org.example.ServerArchitecture
 //
-// TESTING
-//   curl http://localhost:8000/status
-//   curl -u admin:secret http://localhost:8000/hello
-//   curl -u admin:secret "http://localhost:8000/greet?name=John%20Doe"
-//   curl -u admin:secret -X POST http://localhost:8000/echo -d '{"key":"val"}'
-//   curl -u admin:secret http://localhost:8000/files/hello.txt
+// Test:
+//   # 1. Get a token
+//   TOKEN=$(curl -sk -X POST https://localhost:8443/login \
+//     -H "Content-Type: application/json"                \
+//     -d '{"username":"admin","password":"secret"}'      \
+//     | grep -o '"token":"[^"]*"' | cut -d'"' -f4)
+//
+//   # 2. Use the token
+//   curl -sk -H "Authorization: Bearer $TOKEN" https://localhost:8443/hello
+//   curl -sk -H "Authorization: Bearer $TOKEN" "https://localhost:8443/greet?name=Alice"
+//   curl -sk -H "Authorization: Bearer $TOKEN" -X POST https://localhost:8443/echo \
+//        -d '{"key":"value"}'
+//   curl -sk -H "Authorization: Bearer $TOKEN" https://localhost:8443/users/42
 // =============================================================
 
 import com.google.gson.Gson;
 import com.sun.net.httpserver.*;
 
-import java.io.IOException;
-import java.io.OutputStream;
+import javax.crypto.Mac;
+import javax.crypto.spec.SecretKeySpec;
+import javax.net.ssl.*;
+import java.io.*;
 import java.net.InetSocketAddress;
 import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
-import java.nio.file.Files;
-import java.nio.file.Path;
-import java.nio.file.Paths;
-import java.time.Duration;
+import java.security.*;
 import java.time.Instant;
-import java.util.Base64;
-import java.util.HashMap;
-import java.util.Map;
-import java.util.Optional;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
-import java.util.concurrent.atomic.AtomicLong;
+import java.util.*;
+import java.util.concurrent.*;
 import java.util.logging.Level;
-import java.util.logging.Logger;
+import java.util.logging.*;
+import java.util.regex.*;
 
 public class ServerArchitecture {
 
-    private static final Logger log = Logger.getLogger(ServerArchitecture.class.getName());
-    private static final int PORT = 8000;
-    static final int MAX_BODY_BYTES = 10_000;  // Protects server from large payload attacks
-    static final Gson GSON = new Gson();
+    private static final Logger log  = Logger.getLogger(ServerArchitecture.class.getName());
+    private static final int    PORT = 8443;   // standard HTTPS port range for dev
 
-    // ----------------------------------------------------------
-    // Shared server state
-    // ----------------------------------------------------------
-    static final Instant SERVER_START = Instant.now(); // For uptime calculation
-    static final AtomicLong REQUEST_COUNTER = new AtomicLong(0); // Thread-safe request counter
-
-    // Root directory for static file serving
-    static final Path FILES_ROOT = Paths.get("public").toAbsolutePath().normalize();
+    static final int  MAX_BODY_BYTES = 10_000;
+    static final Gson GSON           = new Gson();
 
     public static void main(String[] args) {
 
-        // Load credentials from environment variables
-        String appUser = System.getenv("APP_USER");
-        String appPass = System.getenv("APP_PASS");
-
-        if (appUser == null || appUser.isBlank()) {
-            log.severe("APP_USER environment variable is not set. Refusing to start.");
-            System.exit(1);
-        }
-        if (appPass == null || appPass.isBlank()) {
-            log.severe("APP_PASS environment variable is not set. Refusing to start.");
-            System.exit(1);
-        }
-
-        // Ensure the public files directory exists
-        if (!Files.exists(FILES_ROOT)) {
-            log.warning("Static files directory not found: " + FILES_ROOT + " — creating it now.");
-            try { Files.createDirectories(FILES_ROOT); }
-            catch (IOException e) {
-                log.log(Level.SEVERE, "Could not create public directory", e);
-                System.exit(1);
-            }
-        }
+        // --- Load required environment variables ---
+        String appUser      = requireEnv("APP_USER");
+        String appPass      = requireEnv("APP_PASS");
+        String jwtSecret    = requireEnv("JWT_SECRET");
+        String keystorePass = requireEnv("KEYSTORE_PASS");
 
         try {
-            HttpServer server = HttpServer.create(new InetSocketAddress(PORT), 0);
+            // -------------------------------------------------------
+            // IMPROVEMENT 2: HTTPS — swap HttpServer for HttpsServer
+            //
+            // HttpsServer is the TLS-capable sibling of HttpServer.
+            // It needs an SSLContext which holds the server certificate
+            // (loaded from a JKS keystore file on disk).
+            // -------------------------------------------------------
+            HttpsServer server = HttpsServer.create(new InetSocketAddress(PORT), 0);
+            server.setHttpsConfigurator(buildHttpsConfigurator(keystorePass));
+
             ExecutorService pool = Executors.newCachedThreadPool();
             server.setExecutor(pool);
 
-            AuthFilter auth = new AuthFilter(appUser, appPass);
-            RequestLogger logger = new RequestLogger();
+            // -------------------------------------------------------
+            // IMPROVEMENT 1: Router
+            //
+            // Instead of registering each route directly on the server
+            // we create a Router, register handlers on it, and attach
+            // it as a single catch-all context on "/".
+            // The Router handles 404 and 405 internally.
+            // -------------------------------------------------------
+            JwtFilter  jwt    = new JwtFilter(jwtSecret);
+            Router     router = new Router();
 
-            // Route registrations
-            registerRoute(server, "/status", new StatusHandler(), logger);
-            registerRoute(server, "/hello", new HelloHandler(), logger, auth, new MethodFilter("GET"));
-            registerRoute(server, "/greet", new GreetHandler(), logger, auth, new MethodFilter("GET"));
-            registerRoute(server, "/echo",  new EchoHandler(), logger, auth, new MethodFilter("POST"));
-            registerRoute(server, "/files/", new FilesHandler(), logger, auth, new MethodFilter("GET"));
+            // Public route — no JWT filter
+            router.add("POST", "/login", new LoginHandler(appUser, appPass, jwtSecret));
 
-            // Graceful shutdown
+            // Protected routes — JWT filter applied
+            router.add("GET",  "/hello",        jwt.wrap(new HelloHandler()));
+            router.add("GET",  "/greet",         jwt.wrap(new GreetHandler()));
+            router.add("POST", "/echo",          jwt.wrap(new EchoHandler()));
+            router.add("GET",  "/users/{id}",    jwt.wrap(new UserHandler()));   // path param demo
+
+            // Attach the router as the single handler for all paths
+            server.createContext("/", router);
+
             Runtime.getRuntime().addShutdownHook(new Thread(() -> {
-                log.info("Shutting down server...");
+                log.info("Shutting down...");
                 server.stop(2);
                 pool.shutdown();
-                log.info("Server stopped. Total requests served: " + REQUEST_COUNTER.get());
             }));
 
             server.start();
-            log.info("Server running on http://localhost:" + PORT);
-            log.info("Static files served from: " + FILES_ROOT);
+            log.info("HTTPS server running on https://localhost:" + PORT);
 
-        } catch (IOException e) {
+        } catch (Exception e) {
             log.log(Level.SEVERE, "Server could not start", e);
         }
     }
 
-    // Register a route and attach filters in order
-    private static void registerRoute(HttpServer server, String path,
-                                      HttpHandler handler, Filter... filters) {
-        HttpContext ctx = server.createContext(path, handler);
-        for (Filter f : filters) ctx.getFilters().add(f);
-        log.info("Registered route: " + path);
+    // ===========================================================
+    //  IMPROVEMENT 2 (HTTPS): Build SSLContext from a JKS keystore
+    //
+    //  A KeyStore is Java's container for certificates and keys.
+    //  KeyManagerFactory loads our certificate from it.
+    //  SSLContext is the TLS engine — it uses the KeyManager
+    //  to prove the server's identity to connecting clients.
+    //
+    //  The keystore file (keystore.jks) must be in the working
+    //  directory. Generate it once with the keytool command at
+    //  the top of this file.
+    // ===========================================================
+
+    private static HttpsConfigurator buildHttpsConfigurator(String keystorePass)
+            throws Exception {
+
+        char[] password = keystorePass.toCharArray();
+
+        // Load the JKS keystore from disk
+        KeyStore ks = KeyStore.getInstance("JKS");
+        try (InputStream in = new FileInputStream("keystore.jks")) {
+            ks.load(in, password);
+        }
+
+        // KeyManager holds the server's certificate and private key
+        KeyManagerFactory kmf = KeyManagerFactory.getInstance(
+                KeyManagerFactory.getDefaultAlgorithm());
+        kmf.init(ks, password);
+
+        // Build the SSLContext using TLS protocol
+        SSLContext sslContext = SSLContext.getInstance("TLS");
+        sslContext.init(kmf.getKeyManagers(), null, null);
+
+        return new HttpsConfigurator(sslContext) {
+            @Override
+            public void configure(HttpsParameters params) {
+                SSLContext ctx    = getSSLContext();
+                SSLParameters sslParams = ctx.getDefaultSSLParameters();
+                params.setSSLParameters(sslParams);
+            }
+        };
     }
 
     // ===========================================================
-    // FILTER: Request Logger
-    // Logs method, path, elapsed time, request number
+    //  IMPROVEMENT 1: Router
+    //
+    //  Implements HttpHandler so it can be attached as a single
+    //  context on "/". All requests pass through it.
+    //
+    //  Route matching works in two steps:
+    //    1. Path matching  — does the request path match a pattern?
+    //                        e.g. "/users/42" matches "/users/{id}"
+    //    2. Method matching — does the method match the route?
+    //                        path match + wrong method → 405
+    //                        no path match at all       → 404
+    //
+    //  Path parameters ({id}, {name}, etc.) are extracted and
+    //  stored in the exchange's attribute map for handlers to read.
     // ===========================================================
-    static class RequestLogger extends Filter {
-        private static final Logger log = Logger.getLogger(RequestLogger.class.getName());
 
-        @Override
-        public String description() {
-            return "Request Logger — logs every request with timing";
+    static class Router implements HttpHandler {
+
+        private static final Logger log = Logger.getLogger(Router.class.getName());
+
+        // Holds one registered route entry
+        private record Route(String method, Pattern pattern,
+                             List<String> paramNames, HttpHandler handler) {}
+
+        private final List<Route> routes = new ArrayList<>();
+
+        // Register a route. Path segments wrapped in {} become parameters.
+        // e.g. "/users/{id}/posts/{postId}"
+        void add(String method, String pathTemplate, HttpHandler handler) {
+            List<String> paramNames = new ArrayList<>();
+
+            // Convert template to a regex:
+            //   /users/{id}  →  /users/([^/]+)
+            String regex = Arrays.stream(pathTemplate.split("/"))
+                    .map(segment -> {
+                        if (segment.startsWith("{") && segment.endsWith("}")) {
+                            paramNames.add(segment.substring(1, segment.length() - 1));
+                            return "([^/]+)";      // capture group for the param value
+                        }
+                        return Pattern.quote(segment);  // literal segment
+                    })
+                    .reduce((a, b) -> a + "/" + b)
+                    .orElse("");
+
+            routes.add(new Route(method.toUpperCase(),
+                    Pattern.compile("^" + regex + "$"),
+                    paramNames, handler));
+
+            log.info("Route registered: " + method.toUpperCase() + " " + pathTemplate);
         }
 
         @Override
-        public void doFilter(HttpExchange exchange, Chain chain) throws IOException {
-            long requestNumber = REQUEST_COUNTER.incrementAndGet();
-            long startNanos = System.nanoTime();
-            String method = exchange.getRequestMethod();
-            String path   = exchange.getRequestURI().toString();
+        public void handle(HttpExchange exchange) throws IOException {
 
-            chain.doFilter(exchange);
+            String requestPath   = exchange.getRequestURI().getPath();
+            String requestMethod = exchange.getRequestMethod().toUpperCase();
 
-            long elapsedMs = (System.nanoTime() - startNanos) / 1_000_000;
-            log.info(String.format("[#%d] %s %s completed in %dms",
-                    requestNumber, method, path, elapsedMs));
-        }
-    }
+            boolean pathFound = false;
 
-    // ===========================================================
-    // FILTER: Basic Authentication
-    // ===========================================================
-    static class AuthFilter extends Filter {
-        private final String expectedUsername;
-        private final String expectedPassword;
+            for (Route route : routes) {
+                Matcher matcher = route.pattern().matcher(requestPath);
 
-        AuthFilter(String username, String password) {
-            this.expectedUsername = username;
-            this.expectedPassword = password;
-        }
+                if (matcher.matches()) {
+                    pathFound = true;   // at least one route matches this path
 
-        @Override
-        public String description() { return "HTTP Basic Authentication Filter"; }
+                    if (!route.method().equals(requestMethod)) {
+                        continue;       // path matches but wrong method — keep looking
+                    }
 
-        @Override
-        public void doFilter(HttpExchange exchange, Chain chain) throws IOException {
-            String authHeader = exchange.getRequestHeaders().getFirst("Authorization");
-            if (authHeader == null || !authHeader.startsWith("Basic")) {
-                rejectUnauthorized(exchange);
+                    // Extract path parameters and store them for the handler
+                    Map<String, String> pathParams = new HashMap<>();
+                    for (int i = 0; i < route.paramNames().size(); i++) {
+                        pathParams.put(route.paramNames().get(i), matcher.group(i + 1));
+                    }
+                    exchange.setAttribute("pathParams", pathParams);
+
+                    // Delegate to the matched handler
+                    route.handler().handle(exchange);
+                    return;
+                }
+            }
+
+            // Path was found but no method matched → 405
+            if (pathFound) {
+                log.warning("405 — method not allowed: " + requestMethod + " " + requestPath);
+                sendResponse(exchange, 405, "application/json",
+                        GSON.toJson(Map.of("error", "Method Not Allowed")),
+                        CachePolicy.NO_STORE);
                 return;
             }
 
-            try {
-                String decoded = new String(Base64.getDecoder()
-                        .decode(authHeader.substring("Basic ".length())), StandardCharsets.UTF_8);
-                String[] parts = decoded.split(":", 2);
+            // No path matched at all → 404
+            log.warning("404 — no route for: " + requestMethod + " " + requestPath);
+            sendResponse(exchange, 404, "application/json",
+                    GSON.toJson(Map.of("error", "Not Found")),
+                    CachePolicy.NO_STORE);
+        }
+    }
 
-                if (parts.length != 2
-                        || !parts[0].equals(expectedUsername)
-                        || !parts[1].equals(expectedPassword)) {
-                    rejectUnauthorized(exchange);
-                    return;
-                }
-                chain.doFilter(exchange);
+    // ===========================================================
+    //  IMPROVEMENT 3: JWT — Minimal HS256 Implementation
+    //
+    //  JSON Web Token structure:  header.payload.signature
+    //
+    //  header  = Base64Url({ "alg":"HS256", "typ":"JWT" })
+    //  payload = Base64Url({ "sub":"admin", "exp":1234567890 })
+    //  signature = HMAC-SHA256(header + "." + payload, secret)
+    //
+    //  To verify: re-compute the signature from the received
+    //  header+payload, compare with the signature in the token.
+    //  If they match, the payload has not been tampered with.
+    //  Then check the "exp" claim to ensure the token hasn't expired.
+    //
+    //  This is a minimal implementation for learning purposes.
+    //  In production use a library like java-jwt or jjwt.
+    // ===========================================================
 
-            } catch (IllegalArgumentException e) { rejectUnauthorized(exchange); }
+    static class Jwt {
+
+        private static final long EXPIRY_SECONDS = 3600; // 1 hour
+
+        // --- Token issuance ---
+
+        static String issue(String subject, String secret) throws Exception {
+            String header  = base64url("""
+                    {"alg":"HS256","typ":"JWT"}""");
+            String payload = base64url(
+                    "{\"sub\":\"" + subject + "\","
+                            + "\"exp\":" + (Instant.now().getEpochSecond() + EXPIRY_SECONDS) + "}");
+
+            String headerPayload = header + "." + payload;
+            String signature     = sign(headerPayload, secret);
+            return headerPayload + "." + signature;
         }
 
-        private void rejectUnauthorized(HttpExchange exchange) throws IOException {
-            exchange.getResponseHeaders().set("WWW-Authenticate", "Basic realm=\"SecureApp\"");
-            byte[] body = "401 Unauthorized".getBytes(StandardCharsets.UTF_8);
+        // --- Token verification — returns the subject (username) or throws ---
+
+        static String verify(String token, String secret) throws Exception {
+            String[] parts = token.split("\\.");
+            if (parts.length != 3) throw new IllegalArgumentException("Malformed token");
+
+            // Re-compute signature and compare (constant-time via MessageDigest)
+            String expectedSig = sign(parts[0] + "." + parts[1], secret);
+            if (!MessageDigest.isEqual(
+                    expectedSig.getBytes(StandardCharsets.UTF_8),
+                    parts[2].getBytes(StandardCharsets.UTF_8))) {
+                throw new SecurityException("Invalid token signature");
+            }
+
+            // Decode payload JSON and check expiry
+            String payloadJson = new String(
+                    Base64.getUrlDecoder().decode(parts[1]), StandardCharsets.UTF_8);
+
+            @SuppressWarnings("unchecked")
+            Map<String, Object> claims = GSON.fromJson(payloadJson, Map.class);
+
+            double exp = (Double) claims.get("exp");
+            if (Instant.now().getEpochSecond() > (long) exp) {
+                throw new SecurityException("Token has expired");
+            }
+
+            return (String) claims.get("sub");
+        }
+
+        // --- Helpers ---
+
+        private static String sign(String data, String secret) throws Exception {
+            Mac mac = Mac.getInstance("HmacSHA256");
+            mac.init(new SecretKeySpec(
+                    secret.getBytes(StandardCharsets.UTF_8), "HmacSHA256"));
+            return Base64.getUrlEncoder().withoutPadding()
+                    .encodeToString(mac.doFinal(data.getBytes(StandardCharsets.UTF_8)));
+        }
+
+        private static String base64url(String json) {
+            return Base64.getUrlEncoder().withoutPadding()
+                    .encodeToString(json.getBytes(StandardCharsets.UTF_8));
+        }
+    }
+
+    // ===========================================================
+    //  IMPROVEMENT 3: JWT Filter
+    //
+    //  Checks every request for a valid Bearer token:
+    //    Authorization: Bearer <token>
+    //
+    //  If valid: extracts the username, stores it as an exchange
+    //  attribute so handlers can read who is logged in, then
+    //  passes to the next handler.
+    //
+    //  If invalid or missing: returns 401 immediately.
+    //
+    //  wrap() returns an anonymous HttpHandler that applies the
+    //  filter inline, so public routes (like /login) are simply
+    //  registered without calling wrap() — they are never filtered.
+    // ===========================================================
+
+    static class JwtFilter {
+
+        private static final Logger log = Logger.getLogger(JwtFilter.class.getName());
+        private final String secret;
+
+        JwtFilter(String secret) { this.secret = secret; }
+
+        // Returns a new handler that JWT-checks before delegating
+        HttpHandler wrap(HttpHandler inner) {
+            return exchange -> {
+                String authHeader = exchange.getRequestHeaders().getFirst("Authorization");
+
+                if (authHeader == null || !authHeader.startsWith("Bearer ")) {
+                    log.warning("Missing or malformed Authorization header on "
+                            + exchange.getRequestURI());
+                    rejectUnauthorized(exchange, "Missing Bearer token");
+                    return;
+                }
+
+                String token = authHeader.substring("Bearer ".length()).trim();
+
+                try {
+                    String username = Jwt.verify(token, secret);
+                    // Store username so handlers can access it
+                    exchange.setAttribute("authenticatedUser", username);
+                    log.info("JWT valid for user: " + username
+                            + " → " + exchange.getRequestURI());
+                    inner.handle(exchange);     // pass to the real handler
+
+                } catch (SecurityException e) {
+                    log.warning("JWT rejected: " + e.getMessage()
+                            + " on " + exchange.getRequestURI());
+                    rejectUnauthorized(exchange, e.getMessage());
+                } catch (Exception e) {
+                    log.log(Level.WARNING, "JWT verification error", e);
+                    rejectUnauthorized(exchange, "Invalid token");
+                }
+            };
+        }
+
+        private void rejectUnauthorized(HttpExchange exchange, String reason) throws IOException {
+            exchange.getResponseHeaders().set("WWW-Authenticate", "Bearer realm=\"SecureApp\"");
+            byte[] body = GSON.toJson(Map.of("error", "Unauthorized", "reason", reason))
+                    .getBytes(StandardCharsets.UTF_8);
             exchange.sendResponseHeaders(401, body.length);
             try (OutputStream out = exchange.getResponseBody()) { out.write(body); }
         }
     }
 
     // ===========================================================
-    // FILTER: HTTP Method Enforcement
+    //  HANDLER 0 (NEW): POST /login
+    //
+    //  Public endpoint — not wrapped by JwtFilter.
+    //  Accepts JSON body: { "username": "...", "password": "..." }
+    //  Validates against APP_USER / APP_PASS.
+    //  On success: issues a JWT and returns it.
+    //  On failure: returns 401.
+    //
+    //  This is the only place in the system where a password
+    //  is ever checked. After this, everything uses tokens.
     // ===========================================================
-    static class MethodFilter extends Filter {
-        private final String allowedMethod;
-        MethodFilter(String allowedMethod) { this.allowedMethod = allowedMethod.toUpperCase(); }
 
-        @Override
-        public String description() { return "HTTP Method Filter — allows: " + allowedMethod; }
+    static class LoginHandler implements HttpHandler {
 
-        @Override
-        public void doFilter(HttpExchange exchange, Chain chain) throws IOException {
-            String method = exchange.getRequestMethod().toUpperCase();
-            if (!method.equals(allowedMethod)) {
-                exchange.getResponseHeaders().set("Allow", allowedMethod);
-                byte[] body = ("405 Method Not Allowed — use " + allowedMethod)
-                        .getBytes(StandardCharsets.UTF_8);
-                exchange.sendResponseHeaders(405, body.length);
-                try (OutputStream out = exchange.getResponseBody()) { out.write(body); }
-                return;
-            }
-            chain.doFilter(exchange);
+        private static final Logger log = Logger.getLogger(LoginHandler.class.getName());
+        private final String validUser;
+        private final String validPass;
+        private final String jwtSecret;
+
+        LoginHandler(String user, String pass, String secret) {
+            this.validUser  = user;
+            this.validPass  = pass;
+            this.jwtSecret  = secret;
         }
-    }
 
-    // ===========================================================
-    // HANDLER: GET /status — health check, no auth
-    // ===========================================================
-    static class StatusHandler implements HttpHandler {
         @Override
         public void handle(HttpExchange exchange) throws IOException {
-            long uptimeSeconds = Duration.between(SERVER_START, Instant.now()).getSeconds();
-            Map<String, Object> status = Map.of(
-                    "status", "ok",
-                    "uptime_seconds", uptimeSeconds,
-                    "total_requests", REQUEST_COUNTER.get(),
-                    "port", PORT
-            );
-            sendResponse(exchange, 200, "application/json", GSON.toJson(status), CachePolicy.NO_STORE);
+            log.info("POST /login from " + exchange.getRemoteAddress());
+            try {
+                byte[] bodyBytes = exchange.getRequestBody().readNBytes(MAX_BODY_BYTES);
+                String bodyJson  = new String(bodyBytes, StandardCharsets.UTF_8);
+
+                @SuppressWarnings("unchecked")
+                Map<String, String> creds = GSON.fromJson(bodyJson, Map.class);
+
+                String username = creds.getOrDefault("username", "");
+                String password = creds.getOrDefault("password", "");
+
+                if (!username.equals(validUser) || !password.equals(validPass)) {
+                    log.warning("Failed login attempt for user: " + username);
+                    sendResponse(exchange, 401, "application/json",
+                            GSON.toJson(Map.of("error", "Invalid credentials")),
+                            CachePolicy.NO_STORE);
+                    return;
+                }
+
+                String token = Jwt.issue(username, jwtSecret);
+                log.info("Issued JWT for user: " + username);
+
+                sendResponse(exchange, 200, "application/json",
+                        GSON.toJson(Map.of("token", token, "expiresIn", "3600s")),
+                        CachePolicy.NO_STORE);
+
+            } catch (Exception e) {
+                log.log(Level.SEVERE, "Error in LoginHandler", e);
+                sendResponse(exchange, 500, "application/json",
+                        GSON.toJson(Map.of("error", "Internal Server Error")),
+                        CachePolicy.NO_STORE);
+            }
         }
     }
 
     // ===========================================================
-    // HANDLER: GET /files/{filename} — static files, auth
+    //  HANDLER 1: GET /hello  (unchanged logic, logger fixed)
     // ===========================================================
-    static class FilesHandler implements HttpHandler {
-        @Override
-        public void handle(HttpExchange exchange) throws IOException {
-            String filename = URLDecoder.decode(exchange.getRequestURI()
-                    .getPath().replaceFirst("^/files/", ""), StandardCharsets.UTF_8);
 
-            if (filename.isBlank()) {
-                sendResponse(exchange, 400, "application/json",
-                        GSON.toJson(Map.of("error", "No filename specified")),
-                        CachePolicy.NO_STORE);
-                return;
-            }
-
-            Path requestedPath = FILES_ROOT.resolve(filename).normalize();
-            if (!requestedPath.startsWith(FILES_ROOT)) {
-                sendResponse(exchange, 403, "application/json",
-                        GSON.toJson(Map.of("error", "Forbidden")),
-                        CachePolicy.NO_STORE);
-                return;
-            }
-
-            if (!Files.exists(requestedPath) || !Files.isRegularFile(requestedPath)) {
-                sendResponse(exchange, 404, "application/json",
-                        GSON.toJson(Map.of("error", "File not found: " + filename)),
-                        CachePolicy.NO_STORE);
-                return;
-            }
-
-            String mimeType = Optional.ofNullable(Files.probeContentType(requestedPath))
-                    .orElse("application/octet-stream");
-            byte[] fileBytes = Files.readAllBytes(requestedPath);
-
-            exchange.getResponseHeaders().set("Content-Type", mimeType);
-            exchange.getResponseHeaders().set("Cache-Control", CachePolicy.PUBLIC.headerValue);
-            exchange.sendResponseHeaders(200, fileBytes.length);
-            try (OutputStream out = exchange.getResponseBody()) { out.write(fileBytes); }
-        }
-    }
-
-    // ===========================================================
-    // HANDLER: /hello, /greet, /echo — as before with proper caching
-    // ===========================================================
     static class HelloHandler implements HttpHandler {
+
+        private static final Logger log = Logger.getLogger(HelloHandler.class.getName());
+
         @Override
         public void handle(HttpExchange exchange) throws IOException {
-            sendResponse(exchange, 200, "text/plain",
-                    "Hello! You are authenticated.", CachePolicy.PRIVATE);
+            log.info("GET /hello");
+            try {
+                String user = (String) exchange.getAttribute("authenticatedUser");
+                sendResponse(exchange, 200, "text/plain",
+                        "Hello, " + user + "! You are authenticated.",
+                        CachePolicy.PRIVATE);
+            } catch (Exception e) {
+                log.log(Level.SEVERE, "Error in HelloHandler", e);
+                sendResponse(exchange, 500, "text/plain",
+                        "500 Internal Server Error", CachePolicy.NO_STORE);
+            }
         }
     }
+
+    // ===========================================================
+    //  HANDLER 2: GET /greet?name=Alice
+    // ===========================================================
 
     static class GreetHandler implements HttpHandler {
+
+        private static final Logger log = Logger.getLogger(GreetHandler.class.getName());
+
         @Override
         public void handle(HttpExchange exchange) throws IOException {
-            Map<String, String> params = parseQuery(exchange.getRequestURI().getQuery());
-            String name = params.getOrDefault("name", "Stranger");
-            Map<String, String> resp = Map.of("message", "Hello, " + name + "!", "status", "ok");
-            sendResponse(exchange, 200, "application/json", GSON.toJson(resp), CachePolicy.PUBLIC);
+            log.info("GET /greet");
+            try {
+                Map<String, String> params = parseQuery(exchange.getRequestURI().getQuery());
+                String name = params.getOrDefault("name", "Stranger");
+
+                Map<String, String> response = new HashMap<>();
+                response.put("message", "Hello, " + name + "!");
+                response.put("status", "ok");
+
+                sendResponse(exchange, 200, "application/json",
+                        GSON.toJson(response), CachePolicy.PUBLIC);
+            } catch (Exception e) {
+                log.log(Level.SEVERE, "Error in GreetHandler", e);
+                sendResponse(exchange, 500, "application/json",
+                        GSON.toJson(Map.of("error", "Internal Server Error")),
+                        CachePolicy.NO_STORE);
+            }
         }
     }
+
+    // ===========================================================
+    //  HANDLER 3: POST /echo
+    // ===========================================================
 
     static class EchoHandler implements HttpHandler {
+
+        private static final Logger log = Logger.getLogger(EchoHandler.class.getName());
+
         @Override
         public void handle(HttpExchange exchange) throws IOException {
-            byte[] bodyBytes = exchange.getRequestBody().readNBytes(MAX_BODY_BYTES + 1);
-            if (bodyBytes.length > MAX_BODY_BYTES) {
-                sendResponse(exchange, 413, "application/json",
-                        GSON.toJson(Map.of("error", "Payload too large")),
+            log.info("POST /echo");
+            try {
+                String contentLengthHeader =
+                        exchange.getRequestHeaders().getFirst("Content-Length");
+                long contentLength = contentLengthHeader != null
+                        ? Long.parseLong(contentLengthHeader) : -1;
+
+                if (contentLength > MAX_BODY_BYTES) {
+                    sendResponse(exchange, 413, "application/json",
+                            GSON.toJson(Map.of("error", "Payload too large")),
+                            CachePolicy.NO_STORE);
+                    return;
+                }
+
+                byte[] bodyBytes = exchange.getRequestBody().readNBytes(MAX_BODY_BYTES + 1);
+                if (bodyBytes.length > MAX_BODY_BYTES) {
+                    sendResponse(exchange, 413, "application/json",
+                            GSON.toJson(Map.of("error", "Payload too large")),
+                            CachePolicy.NO_STORE);
+                    return;
+                }
+
+                String body = new String(bodyBytes, StandardCharsets.UTF_8);
+                Map<String, Object> responseMap = new HashMap<>();
+                responseMap.put("echo", body.isEmpty() ? "(empty)" : body);
+
+                sendResponse(exchange, 200, "application/json",
+                        GSON.toJson(responseMap), CachePolicy.NO_STORE);
+            } catch (Exception e) {
+                log.log(Level.SEVERE, "Error in EchoHandler", e);
+                sendResponse(exchange, 500, "application/json",
+                        GSON.toJson(Map.of("error", "Internal Server Error")),
                         CachePolicy.NO_STORE);
-                return;
             }
-            String body = new String(bodyBytes, StandardCharsets.UTF_8);
-            sendResponse(exchange, 200, "application/json",
-                    GSON.toJson(Map.of("echo", body.isEmpty() ? "(empty)" : body)),
-                    CachePolicy.NO_STORE);
         }
     }
 
     // ===========================================================
-    // ENUM: Cache Policy
+    //  HANDLER 4 (NEW): GET /users/{id}
+    //
+    //  Demonstrates reading a path parameter extracted by the Router.
+    //  exchange.getAttribute("pathParams") returns the map the Router
+    //  populated when it matched /users/{id} against the request path.
     // ===========================================================
-    enum CachePolicy {
-        PUBLIC("public, max-age=3600"),
-        PRIVATE("private, max-age=600"),
-        NO_STORE("no-store");
-        final String headerValue;
-        CachePolicy(String v) { this.headerValue = v; }
+
+    static class UserHandler implements HttpHandler {
+
+        private static final Logger log = Logger.getLogger(UserHandler.class.getName());
+
+        @Override
+        @SuppressWarnings("unchecked")
+        public void handle(HttpExchange exchange) throws IOException {
+            log.info("GET /users/{id}");
+            try {
+                // Read the path parameter the Router extracted
+                Map<String, String> pathParams =
+                        (Map<String, String>) exchange.getAttribute("pathParams");
+                String userId = pathParams.getOrDefault("id", "unknown");
+
+                // In a real app this is where you'd query a database
+                Map<String, String> response = new HashMap<>();
+                response.put("userId", userId);
+                response.put("note", "Real app would fetch user " + userId + " from a database");
+
+                sendResponse(exchange, 200, "application/json",
+                        GSON.toJson(response), CachePolicy.PRIVATE);
+            } catch (Exception e) {
+                log.log(Level.SEVERE, "Error in UserHandler", e);
+                sendResponse(exchange, 500, "application/json",
+                        GSON.toJson(Map.of("error", "Internal Server Error")),
+                        CachePolicy.NO_STORE);
+            }
+        }
     }
 
     // ===========================================================
-    // UTILS
+    //  Cache Policy Enum (unchanged)
     // ===========================================================
+
+    enum CachePolicy {
+        PUBLIC  ("public, max-age=3600"),
+        PRIVATE ("private, max-age=600"),
+        NO_STORE("no-store");
+
+        final String headerValue;
+        CachePolicy(String headerValue) { this.headerValue = headerValue; }
+    }
+
+    // ===========================================================
+    //  Shared Utilities
+    // ===========================================================
+
+    private static String requireEnv(String name) {
+        String value = System.getenv(name);
+        if (value == null || value.isBlank()) {
+            log.severe(name + " environment variable is not set. Refusing to start.");
+            System.exit(1);
+        }
+        return value;
+    }
+
     static void sendResponse(HttpExchange exchange, int status,
-                             String contentType, String body, CachePolicy cache) throws IOException {
+                             String contentType, String body,
+                             CachePolicy cache) throws IOException {
         byte[] bytes = body.getBytes(StandardCharsets.UTF_8);
-        exchange.getResponseHeaders().set("Content-Type", contentType + "; charset=UTF-8");
+        exchange.getResponseHeaders().set("Content-Type",  contentType + "; charset=UTF-8");
         exchange.getResponseHeaders().set("Cache-Control", cache.headerValue);
         exchange.sendResponseHeaders(status, bytes.length);
         try (OutputStream out = exchange.getResponseBody()) { out.write(bytes); }
@@ -399,10 +689,11 @@ public class ServerArchitecture {
             try {
                 String key   = URLDecoder.decode(parts[0], StandardCharsets.UTF_8);
                 String value = parts.length == 2
-                        ? URLDecoder.decode(parts[1], StandardCharsets.UTF_8)
-                        : "";
+                        ? URLDecoder.decode(parts[1], StandardCharsets.UTF_8) : "";
                 result.put(key, value);
-            } catch (IllegalArgumentException ignored) {}
+            } catch (IllegalArgumentException e) {
+                log.warning("Skipping malformed query param: " + parts[0]);
+            }
         }
         return result;
     }
