@@ -1,75 +1,93 @@
 package org.example;
 
 // =============================================================
-// STAGE 4 — Level 3: Architectural Upgrades
-// Builds on all Level 1 improvements. Adds:
+// STAGE 4 — Level 4: Production Concepts
+// Builds on all Level 3 architecture. Adds:
 //
-//   1. Router
-//      Centralised route registry mapping (method + path pattern)
-//      to handlers. Supports path parameters (/users/{id}).
-//      Automatically returns 404 for unknown paths and 405 when
-//      the path exists but the method doesn't match.
+//   1. SQLite Persistence Layer
+//      UserRepository wraps all database access via JDBC.
+//      Handlers never touch SQL directly — they call the repo.
+//      Passwords hashed with bcrypt (jBCrypt library).
+//      DB file (users.db) created and seeded automatically.
 //
-//   2. HTTPS / TLS
-//      Switches from HttpServer to HttpsServer. Loads a keys0tore
-//      (self-signed certificate) and wraps the server in SSLContext.
-//      Basic Auth credentials are no longer transmitted in plaintext.
+//   2. Rate Limiting
+//      RateLimitFilter runs first on every request.
+//      Tracks requests per IP in a sliding 60-second window.
+//      Exceeding 60 req/min returns 429 Too Many Requests.
+//      Uses ConcurrentHashMap + AtomicInteger for thread safety.
+//      A background thread prunes stale IP entries every minute.
 //
-//   3. JWT Authentication
-//      Replaces Basic Auth. A POST /login endpoint exchanges
-//      username + password for a signed JWT token (HS256).
-//      All protected routes verify the token via JwtFilter.
-//      Tokens expire after 1 hour. No session state on the server.
+// Full route table:
+//   POST /login              → public, issues JWT
+//   GET  /hello              → JWT required
+//   GET  /greet?name=X       → JWT required
+//   POST /echo               → JWT required
+//   GET  /users/{id}         → JWT required, fetches from DB
+//   POST /users              → JWT required, creates user in DB
+//   DELETE /users/{id}       → JWT required, deletes from DB
 //
 // Architecture:
 //
 //   HTTPS Request
 //         │
 //         ▼
-//    [TLS Layer]       ← decrypts the connection
+//   [RateLimitFilter]   ← NEW: 429 if IP exceeds 60 req/min
 //         │
 //         ▼
-//      [Router]        ← matches path/method, extracts {params}
+//      [Router]         ← matches path/method, extracts {params}
 //         │
 //         ▼
-//    [JwtFilter]       ← verifies token signature + expiry
-//         │              /login is exempt from this filter
+//    [JwtFilter]        ← verifies token
+//         │
 //         ▼
-//     [Handler]        ← only sees valid authenticated requests
+//     [Handler]         ← business logic
+//         │
+//         ▼
+//  [UserRepository]     ← NEW: all SQL lives here
+//         │
+//         ▼
+//      [SQLite]         ← NEW: users.db on disk
 //
-// Setup (one-time):
-//   keytool -genkeypair -alias server -keyalg RSA -keysize 2048  \
-//           -validity 365 -keystore keystore.jks                 \
-//           -storepass changeit -keypass changeit                \
-//           -dname "CN=localhost"
+// Dependencies (place jars in lib/):
+//   gson-2.10.1.jar       https://repo1.maven.org/maven2/com/google/code/gson/gson/2.10.1/
+//   sqlite-jdbc-3.45.jar  https://repo1.maven.org/maven2/org/xerial/sqlite-jdbc/3.45.3.0/
+//   jbcrypt-0.4.jar       https://repo1.maven.org/maven2/org/mindrot/jbcrypt/0.4/
 //
-// Environment variables required:
+// Environment variables:
 //   APP_USER=admin
-//   APP_PASS=secret
-//   JWT_SECRET=a-long-random-string-at-least-32-chars
-//   KEYSTORE_PASS=changeit          (matches keytool -storepass)
+//   APP_PASS=secret        (bcrypt-hashed and stored in DB on first run)
+//   JWT_SECRET=<32+ char random string>
+//   KEYSTORE_PASS=changeit
 //
-// Run:
-//   javac -cp .:gson-2.10.1.jar ServerArchitecture.java
-//   java  -cp .:gson-2.10.1.jar org.example.ServerArchitecture
+// Build and run (without Docker):
+//   javac -cp "lib/*" -d out src/org/example/ServerArchitecture.java
+//   java  -cp "lib/*:out" org.example.ServerArchitecture
+//
+// Build and run (with Docker — see Dockerfile):
+//   docker build -t java-server .
+//   docker run -p 8443:8443 \
+//     -e APP_USER=admin -e APP_PASS=secret \
+//     -e JWT_SECRET=supersecretkey123456789012345678 \
+//     -e KEYSTORE_PASS=changeit \
+//     java-server
 //
 // Test:
-//   # 1. Get a token
 //   TOKEN=$(curl -sk -X POST https://localhost:8443/login \
-//     -H "Content-Type: application/json"                \
-//     -d '{"username":"admin","password":"secret"}'      \
+//     -H "Content-Type: application/json"               \
+//     -d '{"username":"admin","password":"secret"}'     \
 //     | grep -o '"token":"[^"]*"' | cut -d'"' -f4)
 //
-//   # 2. Use the token
-//   curl -sk -H "Authorization: Bearer $TOKEN" https://localhost:8443/hello
-//   curl -sk -H "Authorization: Bearer $TOKEN" "https://localhost:8443/greet?name=Alice"
-//   curl -sk -H "Authorization: Bearer $TOKEN" -X POST https://localhost:8443/echo \
-//        -d '{"key":"value"}'
-//   curl -sk -H "Authorization: Bearer $TOKEN" https://localhost:8443/users/42
+//   curl -sk -H "Authorization: Bearer $TOKEN" https://localhost:8443/users/1
+//   curl -sk -H "Authorization: Bearer $TOKEN" -X POST https://localhost:8443/users \
+//        -H "Content-Type: application/json" \
+//        -d '{"username":"alice","password":"pass123"}'
+//   curl -sk -H "Authorization: Bearer $TOKEN" -X DELETE https://localhost:8443/users/2
 // =============================================================
 
 import com.google.gson.Gson;
 import com.sun.net.httpserver.*;
+import com.sun.net.httpserver.Filter;
+import org.mindrot.jbcrypt.BCrypt;
 
 import javax.crypto.Mac;
 import javax.crypto.spec.SecretKeySpec;
@@ -79,70 +97,73 @@ import java.net.InetSocketAddress;
 import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
 import java.security.*;
+import java.sql.*;
 import java.time.Instant;
 import java.util.*;
 import java.util.concurrent.*;
-import java.util.logging.Level;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.logging.*;
 import java.util.regex.*;
 
 public class ServerArchitecture {
 
     private static final Logger log  = Logger.getLogger(ServerArchitecture.class.getName());
-    private static final int    PORT = 8443;   // standard HTTPS port range for dev
+    private static final int    PORT = 8443;
 
     static final int  MAX_BODY_BYTES = 10_000;
     static final Gson GSON           = new Gson();
 
     public static void main(String[] args) {
 
-        // --- Load required environment variables ---
         String appUser      = requireEnv("APP_USER");
         String appPass      = requireEnv("APP_PASS");
         String jwtSecret    = requireEnv("JWT_SECRET");
         String keystorePass = requireEnv("KEYSTORE_PASS");
 
         try {
-            // -------------------------------------------------------
-            // IMPROVEMENT 2: HTTPS — swap HttpServer for HttpsServer
-            //
-            // HttpsServer is the TLS-capable sibling of HttpServer.
-            // It needs an SSLContext which holds the server certificate
-            // (loaded from a JKS keystore file on disk).
-            // -------------------------------------------------------
+            // ---------------------------------------------------
+            // LEVEL 4: Initialise the database and seed the admin
+            // user on first run. This happens before the server
+            // starts — if the DB can't be set up, we fail fast.
+            // ---------------------------------------------------
+            UserRepository userRepo = new UserRepository("users.db");
+            userRepo.initialise(appUser, appPass);
+
             HttpsServer server = HttpsServer.create(new InetSocketAddress(PORT), 0);
             server.setHttpsConfigurator(buildHttpsConfigurator(keystorePass));
 
             ExecutorService pool = Executors.newCachedThreadPool();
             server.setExecutor(pool);
 
-            // -------------------------------------------------------
-            // IMPROVEMENT 1: Router
-            //
-            // Instead of registering each route directly on the server
-            // we create a Router, register handlers on it, and attach
-            // it as a single catch-all context on "/".
-            // The Router handles 404 and 405 internally.
-            // -------------------------------------------------------
-            JwtFilter  jwt    = new JwtFilter(jwtSecret);
-            Router     router = new Router();
+            JwtFilter jwt    = new JwtFilter(jwtSecret);
+            Router    router = new Router();
 
-            // Public route — no JWT filter
-            router.add("POST", "/login", new LoginHandler(appUser, appPass, jwtSecret));
+            // Public
+            router.add("POST",   "/login",       new LoginHandler(userRepo, jwtSecret));
 
-            // Protected routes — JWT filter applied
-            router.add("GET",  "/hello",        jwt.wrap(new HelloHandler()));
-            router.add("GET",  "/greet",         jwt.wrap(new GreetHandler()));
-            router.add("POST", "/echo",          jwt.wrap(new EchoHandler()));
-            router.add("GET",  "/users/{id}",    jwt.wrap(new UserHandler()));   // path param demo
+            // Protected — JWT wrapped
+            router.add("GET",    "/hello",        jwt.wrap(new HelloHandler()));
+            router.add("GET",    "/greet",        jwt.wrap(new GreetHandler()));
+            router.add("POST",   "/echo",         jwt.wrap(new EchoHandler()));
+            router.add("GET",    "/users/{id}",   jwt.wrap(new GetUserHandler(userRepo)));
+            router.add("POST",   "/users",        jwt.wrap(new CreateUserHandler(userRepo)));
+            router.add("DELETE", "/users/{id}",   jwt.wrap(new DeleteUserHandler(userRepo)));
 
-            // Attach the router as the single handler for all paths
-            server.createContext("/", router);
+            // ---------------------------------------------------
+            // LEVEL 4: Attach the RateLimitFilter as a context
+            // filter on "/". It runs before the Router for every
+            // single request regardless of path or auth status.
+            // ---------------------------------------------------
+            RateLimitFilter rateLimiter = new RateLimitFilter(60, 60);
+            HttpContext rootContext = server.createContext("/", router);
+            rootContext.getFilters().add(rateLimiter);
 
             Runtime.getRuntime().addShutdownHook(new Thread(() -> {
                 log.info("Shutting down...");
                 server.stop(2);
                 pool.shutdown();
+                rateLimiter.shutdown();
+                userRepo.close();
             }));
 
             server.start();
@@ -154,319 +175,265 @@ public class ServerArchitecture {
     }
 
     // ===========================================================
-    //  IMPROVEMENT 2 (HTTPS): Build SSLContext from a JKS keystore
+    //  LEVEL 4 — ADDITION 1: UserRepository (Persistence Layer)
     //
-    //  A KeyStore is Java's container for certificates and keys.
-    //  KeyManagerFactory loads our certificate from it.
-    //  SSLContext is the TLS engine — it uses the KeyManager
-    //  to prove the server's identity to connecting clients.
+    //  The Repository pattern keeps all SQL in one class.
+    //  Handlers call methods like userRepo.findById(id) and never
+    //  write a SQL string themselves. Benefits:
+    //    - If you switch databases, change one class not ten handlers
+    //    - SQL logic is testable in isolation
+    //    - Handlers stay readable — no SQL strings cluttering them
     //
-    //  The keystore file (keystore.jks) must be in the working
-    //  directory. Generate it once with the keytool command at
-    //  the top of this file.
+    //  JDBC (Java Database Connectivity) is the standard Java API
+    //  for relational databases. The same code works for SQLite,
+    //  PostgreSQL, MySQL — only the JDBC URL and driver jar change.
+    //
+    //  Passwords are stored as bcrypt hashes, never plaintext.
+    //  BCrypt.hashpw() produces a new random salt every time so
+    //  two identical passwords produce different hash strings.
+    //  BCrypt.checkpw() verifies a plaintext password against a hash.
     // ===========================================================
 
-    private static HttpsConfigurator buildHttpsConfigurator(String keystorePass)
-            throws Exception {
+    static class UserRepository {
 
-        char[] password = keystorePass.toCharArray();
+        private static final Logger log = Logger.getLogger(UserRepository.class.getName());
 
-        // Load the JKS keystore from disk
-        KeyStore ks = KeyStore.getInstance("JKS");
-        try (InputStream in = new FileInputStream("keystore.jks")) {
-            ks.load(in, password);
+        // Represents a row from the users table
+        record User(int id, String username, String passwordHash, String createdAt) {}
+
+        private final Connection conn;
+
+        UserRepository(String dbPath) throws SQLException {
+            // sqlite:// URL tells JDBC to use SQLite. The file is created
+            // automatically if it doesn't exist.
+            conn = DriverManager.getConnection("jdbc:sqlite:" + dbPath);
+            log.info("Connected to SQLite database: " + dbPath);
         }
 
-        // KeyManager holds the server's certificate and private key
-        KeyManagerFactory kmf = KeyManagerFactory.getInstance(
-                KeyManagerFactory.getDefaultAlgorithm());
-        kmf.init(ks, password);
-
-        // Build the SSLContext using TLS protocol
-        SSLContext sslContext = SSLContext.getInstance("TLS");
-        sslContext.init(kmf.getKeyManagers(), null, null);
-
-        return new HttpsConfigurator(sslContext) {
-            @Override
-            public void configure(HttpsParameters params) {
-                SSLContext ctx    = getSSLContext();
-                SSLParameters sslParams = ctx.getDefaultSSLParameters();
-                params.setSSLParameters(sslParams);
+        // Create the users table if it doesn't exist, and seed the admin user.
+        // Called once at startup — safe to call on every restart (IF NOT EXISTS).
+        void initialise(String adminUsername, String adminPassword) throws SQLException {
+            try (Statement stmt = conn.createStatement()) {
+                stmt.execute("""
+                    CREATE TABLE IF NOT EXISTS users (
+                        id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                        username     TEXT    NOT NULL UNIQUE,
+                        password_hash TEXT   NOT NULL,
+                        created_at   TEXT    NOT NULL DEFAULT (datetime('now'))
+                    )
+                """);
             }
-        };
+            log.info("Users table ready.");
+
+            // Only insert admin if they don't already exist
+            if (findByUsername(adminUsername).isEmpty()) {
+                // BCrypt.hashpw() hashes the password with a random salt.
+                // The salt is embedded in the resulting string — no need to
+                // store it separately.
+                String hash = BCrypt.hashpw(adminPassword, BCrypt.gensalt());
+                create(adminUsername, hash);
+                log.info("Admin user '" + adminUsername + "' seeded into database.");
+            } else {
+                log.info("Admin user already exists — skipping seed.");
+            }
+        }
+
+        // Find a user by their numeric ID. Returns Optional — empty if not found.
+        Optional<User> findById(int id) throws SQLException {
+            // PreparedStatement prevents SQL injection — the ? is a parameter
+            // placeholder, never concatenated directly into the SQL string.
+            String sql = "SELECT id, username, password_hash, created_at FROM users WHERE id = ?";
+            try (PreparedStatement ps = conn.prepareStatement(sql)) {
+                ps.setInt(1, id);
+                ResultSet rs = ps.executeQuery();
+                if (rs.next()) {
+                    return Optional.of(new User(
+                            rs.getInt("id"),
+                            rs.getString("username"),
+                            rs.getString("password_hash"),
+                            rs.getString("created_at")));
+                }
+            }
+            return Optional.empty();
+        }
+
+        // Find a user by username. Used during login to validate credentials.
+        Optional<User> findByUsername(String username) throws SQLException {
+            String sql = "SELECT id, username, password_hash, created_at FROM users WHERE username = ?";
+            try (PreparedStatement ps = conn.prepareStatement(sql)) {
+                ps.setString(1, username);
+                ResultSet rs = ps.executeQuery();
+                if (rs.next()) {
+                    return Optional.of(new User(
+                            rs.getInt("id"),
+                            rs.getString("username"),
+                            rs.getString("password_hash"),
+                            rs.getString("created_at")));
+                }
+            }
+            return Optional.empty();
+        }
+
+        // Insert a new user. Password must already be bcrypt-hashed by the caller.
+        User create(String username, String passwordHash) throws SQLException {
+            String sql = "INSERT INTO users (username, password_hash) VALUES (?, ?)";
+            try (PreparedStatement ps = conn.prepareStatement(sql,
+                    Statement.RETURN_GENERATED_KEYS)) {
+                ps.setString(1, username);
+                ps.setString(2, passwordHash);
+                ps.executeUpdate();
+
+                // RETURN_GENERATED_KEYS lets us read back the auto-generated ID
+                ResultSet keys = ps.getGeneratedKeys();
+                keys.next();
+                int newId = keys.getInt(1);
+                log.info("Created user: " + username + " (id=" + newId + ")");
+                return findById(newId).orElseThrow();
+            }
+        }
+
+        // Delete a user by ID. Returns true if a row was actually deleted.
+        boolean delete(int id) throws SQLException {
+            String sql = "DELETE FROM users WHERE id = ?";
+            try (PreparedStatement ps = conn.prepareStatement(sql)) {
+                ps.setInt(1, id);
+                int affected = ps.executeUpdate();
+                return affected > 0;
+            }
+        }
+
+        void close() {
+            try { conn.close(); } catch (SQLException e) {
+                log.log(Level.WARNING, "Error closing DB connection", e);
+            }
+        }
     }
 
     // ===========================================================
-    //  IMPROVEMENT 1: Router
+    //  LEVEL 4 — ADDITION 2: RateLimitFilter
     //
-    //  Implements HttpHandler so it can be attached as a single
-    //  context on "/". All requests pass through it.
+    //  Tracks how many requests each IP address has made within
+    //  a rolling time window. Rejects excess requests with 429.
     //
-    //  Route matching works in two steps:
-    //    1. Path matching  — does the request path match a pattern?
-    //                        e.g. "/users/42" matches "/users/{id}"
-    //    2. Method matching — does the method match the route?
-    //                        path match + wrong method → 405
-    //                        no path match at all       → 404
+    //  Data structure:
+    //    ConcurrentHashMap<String, RequestWindow>
+    //      key   = client IP address string
+    //      value = window tracking request count + window start time
     //
-    //  Path parameters ({id}, {name}, etc.) are extracted and
-    //  stored in the exchange's attribute map for handlers to read.
+    //  ConcurrentHashMap is used instead of HashMap because multiple
+    //  threads handle requests simultaneously. A plain HashMap would
+    //  produce corrupt state under concurrent writes.
+    //
+    //  AtomicInteger is used for the request counter inside each
+    //  window — it provides thread-safe increment without locks.
+    //
+    //  A ScheduledExecutorService runs a cleanup task every minute
+    //  to remove entries for IPs that haven't sent requests recently,
+    //  preventing the map from growing indefinitely.
+    //
+    //  constructor params:
+    //    maxRequests  — how many requests allowed per window
+    //    windowSeconds — how long the window is in seconds
     // ===========================================================
 
-    static class Router implements HttpHandler {
+    static class RateLimitFilter extends Filter {
 
-        private static final Logger log = Logger.getLogger(Router.class.getName());
+        private static final Logger log = Logger.getLogger(RateLimitFilter.class.getName());
 
-        // Holds one registered route entry
-        private record Route(String method, Pattern pattern,
-                             List<String> paramNames, HttpHandler handler) {}
+        // Inner class to track one IP's request window
+        private static class RequestWindow {
+            final AtomicInteger count     = new AtomicInteger(0);
+            volatile long       windowStart = Instant.now().getEpochSecond();
+        }
 
-        private final List<Route> routes = new ArrayList<>();
+        private final int maxRequests;
+        private final long windowSeconds;
+        private final ConcurrentHashMap<String, RequestWindow> windows = new ConcurrentHashMap<>();
+        private final ScheduledExecutorService cleaner = Executors.newSingleThreadScheduledExecutor();
 
-        // Register a route. Path segments wrapped in {} become parameters.
-        // e.g. "/users/{id}/posts/{postId}"
-        void add(String method, String pathTemplate, HttpHandler handler) {
-            List<String> paramNames = new ArrayList<>();
+        RateLimitFilter(int maxRequests, long windowSeconds) {
+            this.maxRequests   = maxRequests;
+            this.windowSeconds = windowSeconds;
 
-            // Convert template to a regex:
-            //   /users/{id}  →  /users/([^/]+)
-            String regex = Arrays.stream(pathTemplate.split("/"))
-                    .map(segment -> {
-                        if (segment.startsWith("{") && segment.endsWith("}")) {
-                            paramNames.add(segment.substring(1, segment.length() - 1));
-                            return "([^/]+)";      // capture group for the param value
-                        }
-                        return Pattern.quote(segment);  // literal segment
-                    })
-                    .reduce((a, b) -> a + "/" + b)
-                    .orElse("");
-
-            routes.add(new Route(method.toUpperCase(),
-                    Pattern.compile("^" + regex + "$"),
-                    paramNames, handler));
-
-            log.info("Route registered: " + method.toUpperCase() + " " + pathTemplate);
+            // Prune stale entries every minute so the map doesn't grow forever.
+            // An entry is stale if it hasn't been active for more than one window.
+            cleaner.scheduleAtFixedRate(() -> {
+                long now = Instant.now().getEpochSecond();
+                windows.entrySet().removeIf(e ->
+                        (now - e.getValue().windowStart) > windowSeconds * 2);
+                log.fine("Rate limiter pruned stale entries. Active IPs: " + windows.size());
+            }, 1, 1, TimeUnit.MINUTES);
         }
 
         @Override
-        public void handle(HttpExchange exchange) throws IOException {
+        public String description() { return "Rate Limit Filter"; }
 
-            String requestPath   = exchange.getRequestURI().getPath();
-            String requestMethod = exchange.getRequestMethod().toUpperCase();
+        @Override
+        public void doFilter(HttpExchange exchange, Filter.Chain chain) throws IOException {
 
-            boolean pathFound = false;
+            // Extract the client IP from the remote address
+            String ip = exchange.getRemoteAddress().getAddress().getHostAddress();
+            long   now = Instant.now().getEpochSecond();
 
-            for (Route route : routes) {
-                Matcher matcher = route.pattern().matcher(requestPath);
+            // computeIfAbsent is atomic — safe under concurrent access.
+            // Gets existing window or creates a new one for this IP.
+            RequestWindow window = windows.computeIfAbsent(ip, k -> new RequestWindow());
 
-                if (matcher.matches()) {
-                    pathFound = true;   // at least one route matches this path
-
-                    if (!route.method().equals(requestMethod)) {
-                        continue;       // path matches but wrong method — keep looking
-                    }
-
-                    // Extract path parameters and store them for the handler
-                    Map<String, String> pathParams = new HashMap<>();
-                    for (int i = 0; i < route.paramNames().size(); i++) {
-                        pathParams.put(route.paramNames().get(i), matcher.group(i + 1));
-                    }
-                    exchange.setAttribute("pathParams", pathParams);
-
-                    // Delegate to the matched handler
-                    route.handler().handle(exchange);
-                    return;
+            // If the window has expired, reset it
+            // synchronized on the window object to prevent two threads
+            // both seeing an expired window and both resetting it
+            synchronized (window) {
+                if ((now - window.windowStart) >= windowSeconds) {
+                    window.windowStart = now;
+                    window.count.set(0);
                 }
             }
 
-            // Path was found but no method matched → 405
-            if (pathFound) {
-                log.warning("405 — method not allowed: " + requestMethod + " " + requestPath);
-                sendResponse(exchange, 405, "application/json",
-                        GSON.toJson(Map.of("error", "Method Not Allowed")),
-                        CachePolicy.NO_STORE);
-                return;
+            int requestCount = window.count.incrementAndGet();
+
+            if (requestCount > maxRequests) {
+                log.warning("Rate limit exceeded for IP: " + ip
+                        + " (" + requestCount + " requests in window)");
+
+                // Retry-After header tells the client how many seconds to wait
+                long retryAfter = windowSeconds - (now - window.windowStart);
+                exchange.getResponseHeaders().set("Retry-After", String.valueOf(retryAfter));
+
+                byte[] body = GSON.toJson(Map.of(
+                        "error",      "Too Many Requests",
+                        "retryAfter", retryAfter + "s"
+                )).getBytes(StandardCharsets.UTF_8);
+
+                exchange.getResponseHeaders().set("Content-Type", "application/json; charset=UTF-8");
+                exchange.sendResponseHeaders(429, body.length);
+                try (OutputStream out = exchange.getResponseBody()) { out.write(body); }
+                return; // do NOT call chain.doFilter — block the request
             }
 
-            // No path matched at all → 404
-            log.warning("404 — no route for: " + requestMethod + " " + requestPath);
-            sendResponse(exchange, 404, "application/json",
-                    GSON.toJson(Map.of("error", "Not Found")),
-                    CachePolicy.NO_STORE);
+            chain.doFilter(exchange); // within limit — proceed
         }
+
+        void shutdown() { cleaner.shutdownNow(); }
     }
 
     // ===========================================================
-    //  IMPROVEMENT 3: JWT — Minimal HS256 Implementation
+    //  HANDLER: POST /login (updated to use UserRepository)
     //
-    //  JSON Web Token structure:  header.payload.signature
-    //
-    //  header  = Base64Url({ "alg":"HS256", "typ":"JWT" })
-    //  payload = Base64Url({ "sub":"admin", "exp":1234567890 })
-    //  signature = HMAC-SHA256(header + "." + payload, secret)
-    //
-    //  To verify: re-compute the signature from the received
-    //  header+payload, compare with the signature in the token.
-    //  If they match, the payload has not been tampered with.
-    //  Then check the "exp" claim to ensure the token hasn't expired.
-    //
-    //  This is a minimal implementation for learning purposes.
-    //  In production use a library like java-jwt or jjwt.
-    // ===========================================================
-
-    static class Jwt {
-
-        private static final long EXPIRY_SECONDS = 3600; // 1 hour
-
-        // --- Token issuance ---
-
-        static String issue(String subject, String secret) throws Exception {
-            String header  = base64url("""
-                    {"alg":"HS256","typ":"JWT"}""");
-            String payload = base64url(
-                    "{\"sub\":\"" + subject + "\","
-                            + "\"exp\":" + (Instant.now().getEpochSecond() + EXPIRY_SECONDS) + "}");
-
-            String headerPayload = header + "." + payload;
-            String signature     = sign(headerPayload, secret);
-            return headerPayload + "." + signature;
-        }
-
-        // --- Token verification — returns the subject (username) or throws ---
-
-        static String verify(String token, String secret) throws Exception {
-            String[] parts = token.split("\\.");
-            if (parts.length != 3) throw new IllegalArgumentException("Malformed token");
-
-            // Re-compute signature and compare (constant-time via MessageDigest)
-            String expectedSig = sign(parts[0] + "." + parts[1], secret);
-            if (!MessageDigest.isEqual(
-                    expectedSig.getBytes(StandardCharsets.UTF_8),
-                    parts[2].getBytes(StandardCharsets.UTF_8))) {
-                throw new SecurityException("Invalid token signature");
-            }
-
-            // Decode payload JSON and check expiry
-            String payloadJson = new String(
-                    Base64.getUrlDecoder().decode(parts[1]), StandardCharsets.UTF_8);
-
-            @SuppressWarnings("unchecked")
-            Map<String, Object> claims = GSON.fromJson(payloadJson, Map.class);
-
-            double exp = (Double) claims.get("exp");
-            if (Instant.now().getEpochSecond() > (long) exp) {
-                throw new SecurityException("Token has expired");
-            }
-
-            return (String) claims.get("sub");
-        }
-
-        // --- Helpers ---
-
-        private static String sign(String data, String secret) throws Exception {
-            Mac mac = Mac.getInstance("HmacSHA256");
-            mac.init(new SecretKeySpec(
-                    secret.getBytes(StandardCharsets.UTF_8), "HmacSHA256"));
-            return Base64.getUrlEncoder().withoutPadding()
-                    .encodeToString(mac.doFinal(data.getBytes(StandardCharsets.UTF_8)));
-        }
-
-        private static String base64url(String json) {
-            return Base64.getUrlEncoder().withoutPadding()
-                    .encodeToString(json.getBytes(StandardCharsets.UTF_8));
-        }
-    }
-
-    // ===========================================================
-    //  IMPROVEMENT 3: JWT Filter
-    //
-    //  Checks every request for a valid Bearer token:
-    //    Authorization: Bearer <token>
-    //
-    //  If valid: extracts the username, stores it as an exchange
-    //  attribute so handlers can read who is logged in, then
-    //  passes to the next handler.
-    //
-    //  If invalid or missing: returns 401 immediately.
-    //
-    //  wrap() returns an anonymous HttpHandler that applies the
-    //  filter inline, so public routes (like /login) are simply
-    //  registered without calling wrap() — they are never filtered.
-    // ===========================================================
-
-    static class JwtFilter {
-
-        private static final Logger log = Logger.getLogger(JwtFilter.class.getName());
-        private final String secret;
-
-        JwtFilter(String secret) { this.secret = secret; }
-
-        // Returns a new handler that JWT-checks before delegating
-        HttpHandler wrap(HttpHandler inner) {
-            return exchange -> {
-                String authHeader = exchange.getRequestHeaders().getFirst("Authorization");
-
-                if (authHeader == null || !authHeader.startsWith("Bearer ")) {
-                    log.warning("Missing or malformed Authorization header on "
-                            + exchange.getRequestURI());
-                    rejectUnauthorized(exchange, "Missing Bearer token");
-                    return;
-                }
-
-                String token = authHeader.substring("Bearer ".length()).trim();
-
-                try {
-                    String username = Jwt.verify(token, secret);
-                    // Store username so handlers can access it
-                    exchange.setAttribute("authenticatedUser", username);
-                    log.info("JWT valid for user: " + username
-                            + " → " + exchange.getRequestURI());
-                    inner.handle(exchange);     // pass to the real handler
-
-                } catch (SecurityException e) {
-                    log.warning("JWT rejected: " + e.getMessage()
-                            + " on " + exchange.getRequestURI());
-                    rejectUnauthorized(exchange, e.getMessage());
-                } catch (Exception e) {
-                    log.log(Level.WARNING, "JWT verification error", e);
-                    rejectUnauthorized(exchange, "Invalid token");
-                }
-            };
-        }
-
-        private void rejectUnauthorized(HttpExchange exchange, String reason) throws IOException {
-            exchange.getResponseHeaders().set("WWW-Authenticate", "Bearer realm=\"SecureApp\"");
-            byte[] body = GSON.toJson(Map.of("error", "Unauthorized", "reason", reason))
-                    .getBytes(StandardCharsets.UTF_8);
-            exchange.sendResponseHeaders(401, body.length);
-            try (OutputStream out = exchange.getResponseBody()) { out.write(body); }
-        }
-    }
-
-    // ===========================================================
-    //  HANDLER 0 (NEW): POST /login
-    //
-    //  Public endpoint — not wrapped by JwtFilter.
-    //  Accepts JSON body: { "username": "...", "password": "..." }
-    //  Validates against APP_USER / APP_PASS.
-    //  On success: issues a JWT and returns it.
-    //  On failure: returns 401.
-    //
-    //  This is the only place in the system where a password
-    //  is ever checked. After this, everything uses tokens.
+    //  Now looks up the user from the database instead of comparing
+    //  against hardcoded env var strings.
+    //  BCrypt.checkpw() verifies the submitted password against
+    //  the stored hash — it never decrypts (bcrypt is one-way).
     // ===========================================================
 
     static class LoginHandler implements HttpHandler {
 
         private static final Logger log = Logger.getLogger(LoginHandler.class.getName());
-        private final String validUser;
-        private final String validPass;
-        private final String jwtSecret;
+        private final UserRepository userRepo;
+        private final String         jwtSecret;
 
-        LoginHandler(String user, String pass, String secret) {
-            this.validUser  = user;
-            this.validPass  = pass;
-            this.jwtSecret  = secret;
+        LoginHandler(UserRepository userRepo, String jwtSecret) {
+            this.userRepo  = userRepo;
+            this.jwtSecret = jwtSecret;
         }
 
         @Override
@@ -474,16 +441,18 @@ public class ServerArchitecture {
             log.info("POST /login from " + exchange.getRemoteAddress());
             try {
                 byte[] bodyBytes = exchange.getRequestBody().readNBytes(MAX_BODY_BYTES);
-                String bodyJson  = new String(bodyBytes, StandardCharsets.UTF_8);
-
                 @SuppressWarnings("unchecked")
-                Map<String, String> creds = GSON.fromJson(bodyJson, Map.class);
+                Map<String, String> creds = GSON.fromJson(
+                        new String(bodyBytes, StandardCharsets.UTF_8), Map.class);
 
                 String username = creds.getOrDefault("username", "");
                 String password = creds.getOrDefault("password", "");
 
-                if (!username.equals(validUser) || !password.equals(validPass)) {
-                    log.warning("Failed login attempt for user: " + username);
+                Optional<UserRepository.User> userOpt = userRepo.findByUsername(username);
+
+                // BCrypt.checkpw() does the comparison — never compare hashes with .equals()
+                if (userOpt.isEmpty() || !BCrypt.checkpw(password, userOpt.get().passwordHash())) {
+                    log.warning("Failed login attempt for: " + username);
                     sendResponse(exchange, 401, "application/json",
                             GSON.toJson(Map.of("error", "Invalid credentials")),
                             CachePolicy.NO_STORE);
@@ -491,8 +460,7 @@ public class ServerArchitecture {
                 }
 
                 String token = Jwt.issue(username, jwtSecret);
-                log.info("Issued JWT for user: " + username);
-
+                log.info("JWT issued for: " + username);
                 sendResponse(exchange, 200, "application/json",
                         GSON.toJson(Map.of("token", token, "expiresIn", "3600s")),
                         CachePolicy.NO_STORE);
@@ -507,21 +475,179 @@ public class ServerArchitecture {
     }
 
     // ===========================================================
-    //  HANDLER 1: GET /hello  (unchanged logic, logger fixed)
+    //  HANDLER: GET /users/{id}  — fetches a user from the DB
+    // ===========================================================
+
+    static class GetUserHandler implements HttpHandler {
+
+        private static final Logger log = Logger.getLogger(GetUserHandler.class.getName());
+        private final UserRepository userRepo;
+
+        GetUserHandler(UserRepository userRepo) { this.userRepo = userRepo; }
+
+        @Override
+        @SuppressWarnings("unchecked")
+        public void handle(HttpExchange exchange) throws IOException {
+            log.info("GET /users/{id}");
+            try {
+                Map<String, String> pathParams =
+                        (Map<String, String>) exchange.getAttribute("pathParams");
+                int id = Integer.parseInt(pathParams.getOrDefault("id", "0"));
+
+                Optional<UserRepository.User> userOpt = userRepo.findById(id);
+
+                if (userOpt.isEmpty()) {
+                    sendResponse(exchange, 404, "application/json",
+                            GSON.toJson(Map.of("error", "User not found")),
+                            CachePolicy.NO_STORE);
+                    return;
+                }
+
+                UserRepository.User user = userOpt.get();
+                // Never return the password hash in an API response
+                Map<String, Object> response = new LinkedHashMap<>();
+                response.put("id",        user.id());
+                response.put("username",  user.username());
+                response.put("createdAt", user.createdAt());
+
+                sendResponse(exchange, 200, "application/json",
+                        GSON.toJson(response), CachePolicy.PRIVATE);
+
+            } catch (NumberFormatException e) {
+                sendResponse(exchange, 400, "application/json",
+                        GSON.toJson(Map.of("error", "Invalid user ID")),
+                        CachePolicy.NO_STORE);
+            } catch (Exception e) {
+                log.log(Level.SEVERE, "Error in GetUserHandler", e);
+                sendResponse(exchange, 500, "application/json",
+                        GSON.toJson(Map.of("error", "Internal Server Error")),
+                        CachePolicy.NO_STORE);
+            }
+        }
+    }
+
+    // ===========================================================
+    //  HANDLER: POST /users  — creates a new user
+    //
+    //  Accepts { "username": "...", "password": "..." }.
+    //  Hashes the password with bcrypt before storing.
+    //  Returns 409 Conflict if username already exists.
+    // ===========================================================
+
+    static class CreateUserHandler implements HttpHandler {
+
+        private static final Logger log = Logger.getLogger(CreateUserHandler.class.getName());
+        private final UserRepository userRepo;
+
+        CreateUserHandler(UserRepository userRepo) { this.userRepo = userRepo; }
+
+        @Override
+        public void handle(HttpExchange exchange) throws IOException {
+            log.info("POST /users");
+            try {
+                byte[] bodyBytes = exchange.getRequestBody().readNBytes(MAX_BODY_BYTES);
+                @SuppressWarnings("unchecked")
+                Map<String, String> body = GSON.fromJson(
+                        new String(bodyBytes, StandardCharsets.UTF_8), Map.class);
+
+                String username = body.getOrDefault("username", "").trim();
+                String password = body.getOrDefault("password", "").trim();
+
+                if (username.isEmpty() || password.isEmpty()) {
+                    sendResponse(exchange, 400, "application/json",
+                            GSON.toJson(Map.of("error", "username and password are required")),
+                            CachePolicy.NO_STORE);
+                    return;
+                }
+
+                // Hash the password before it ever touches the database
+                String hash = BCrypt.hashpw(password, BCrypt.gensalt());
+
+                try {
+                    UserRepository.User created = userRepo.create(username, hash);
+                    Map<String, Object> response = new LinkedHashMap<>();
+                    response.put("id",       created.id());
+                    response.put("username", created.username());
+                    sendResponse(exchange, 201, "application/json",
+                            GSON.toJson(response), CachePolicy.NO_STORE);
+                } catch (SQLException e) {
+                    // SQLite UNIQUE constraint violation error code is 19
+                    if (e.getErrorCode() == 19) {
+                        sendResponse(exchange, 409, "application/json",
+                                GSON.toJson(Map.of("error", "Username already exists")),
+                                CachePolicy.NO_STORE);
+                    } else {
+                        throw e;
+                    }
+                }
+
+            } catch (Exception e) {
+                log.log(Level.SEVERE, "Error in CreateUserHandler", e);
+                sendResponse(exchange, 500, "application/json",
+                        GSON.toJson(Map.of("error", "Internal Server Error")),
+                        CachePolicy.NO_STORE);
+            }
+        }
+    }
+
+    // ===========================================================
+    //  HANDLER: DELETE /users/{id}  — removes a user from the DB
+    // ===========================================================
+
+    static class DeleteUserHandler implements HttpHandler {
+
+        private static final Logger log = Logger.getLogger(DeleteUserHandler.class.getName());
+        private final UserRepository userRepo;
+
+        DeleteUserHandler(UserRepository userRepo) { this.userRepo = userRepo; }
+
+        @Override
+        @SuppressWarnings("unchecked")
+        public void handle(HttpExchange exchange) throws IOException {
+            log.info("DELETE /users/{id}");
+            try {
+                Map<String, String> pathParams =
+                        (Map<String, String>) exchange.getAttribute("pathParams");
+                int id = Integer.parseInt(pathParams.getOrDefault("id", "0"));
+
+                boolean deleted = userRepo.delete(id);
+                if (!deleted) {
+                    sendResponse(exchange, 404, "application/json",
+                            GSON.toJson(Map.of("error", "User not found")),
+                            CachePolicy.NO_STORE);
+                    return;
+                }
+
+                // 204 No Content — success, nothing to return
+                exchange.sendResponseHeaders(204, -1);
+
+            } catch (NumberFormatException e) {
+                sendResponse(exchange, 400, "application/json",
+                        GSON.toJson(Map.of("error", "Invalid user ID")),
+                        CachePolicy.NO_STORE);
+            } catch (Exception e) {
+                log.log(Level.SEVERE, "Error in DeleteUserHandler", e);
+                sendResponse(exchange, 500, "application/json",
+                        GSON.toJson(Map.of("error", "Internal Server Error")),
+                        CachePolicy.NO_STORE);
+            }
+        }
+    }
+
+    // ===========================================================
+    //  Existing handlers — HelloHandler, GreetHandler, EchoHandler
+    //  (unchanged from Level 3)
     // ===========================================================
 
     static class HelloHandler implements HttpHandler {
-
         private static final Logger log = Logger.getLogger(HelloHandler.class.getName());
-
         @Override
         public void handle(HttpExchange exchange) throws IOException {
             log.info("GET /hello");
             try {
                 String user = (String) exchange.getAttribute("authenticatedUser");
                 sendResponse(exchange, 200, "text/plain",
-                        "Hello, " + user + "! You are authenticated.",
-                        CachePolicy.PRIVATE);
+                        "Hello, " + user + "! You are authenticated.", CachePolicy.PRIVATE);
             } catch (Exception e) {
                 log.log(Level.SEVERE, "Error in HelloHandler", e);
                 sendResponse(exchange, 500, "text/plain",
@@ -530,25 +656,17 @@ public class ServerArchitecture {
         }
     }
 
-    // ===========================================================
-    //  HANDLER 2: GET /greet?name=Alice
-    // ===========================================================
-
     static class GreetHandler implements HttpHandler {
-
         private static final Logger log = Logger.getLogger(GreetHandler.class.getName());
-
         @Override
         public void handle(HttpExchange exchange) throws IOException {
             log.info("GET /greet");
             try {
                 Map<String, String> params = parseQuery(exchange.getRequestURI().getQuery());
                 String name = params.getOrDefault("name", "Stranger");
-
                 Map<String, String> response = new HashMap<>();
                 response.put("message", "Hello, " + name + "!");
                 response.put("status", "ok");
-
                 sendResponse(exchange, 200, "application/json",
                         GSON.toJson(response), CachePolicy.PUBLIC);
             } catch (Exception e) {
@@ -560,120 +678,183 @@ public class ServerArchitecture {
         }
     }
 
-    // ===========================================================
-    //  HANDLER 3: POST /echo
-    // ===========================================================
-
     static class EchoHandler implements HttpHandler {
-
         private static final Logger log = Logger.getLogger(EchoHandler.class.getName());
-
         @Override
         public void handle(HttpExchange exchange) throws IOException {
             log.info("POST /echo");
             try {
-                String contentLengthHeader =
-                        exchange.getRequestHeaders().getFirst("Content-Length");
-                long contentLength = contentLengthHeader != null
-                        ? Long.parseLong(contentLengthHeader) : -1;
-
-                if (contentLength > MAX_BODY_BYTES) {
+                String clHeader = exchange.getRequestHeaders().getFirst("Content-Length");
+                long cl = clHeader != null ? Long.parseLong(clHeader) : -1;
+                if (cl > MAX_BODY_BYTES) {
                     sendResponse(exchange, 413, "application/json",
-                            GSON.toJson(Map.of("error", "Payload too large")),
-                            CachePolicy.NO_STORE);
+                            GSON.toJson(Map.of("error", "Payload too large")), CachePolicy.NO_STORE);
                     return;
                 }
-
                 byte[] bodyBytes = exchange.getRequestBody().readNBytes(MAX_BODY_BYTES + 1);
                 if (bodyBytes.length > MAX_BODY_BYTES) {
                     sendResponse(exchange, 413, "application/json",
-                            GSON.toJson(Map.of("error", "Payload too large")),
-                            CachePolicy.NO_STORE);
+                            GSON.toJson(Map.of("error", "Payload too large")), CachePolicy.NO_STORE);
                     return;
                 }
-
                 String body = new String(bodyBytes, StandardCharsets.UTF_8);
-                Map<String, Object> responseMap = new HashMap<>();
-                responseMap.put("echo", body.isEmpty() ? "(empty)" : body);
-
+                Map<String, Object> resp = new HashMap<>();
+                resp.put("echo", body.isEmpty() ? "(empty)" : body);
                 sendResponse(exchange, 200, "application/json",
-                        GSON.toJson(responseMap), CachePolicy.NO_STORE);
+                        GSON.toJson(resp), CachePolicy.NO_STORE);
             } catch (Exception e) {
                 log.log(Level.SEVERE, "Error in EchoHandler", e);
                 sendResponse(exchange, 500, "application/json",
-                        GSON.toJson(Map.of("error", "Internal Server Error")),
-                        CachePolicy.NO_STORE);
+                        GSON.toJson(Map.of("error", "Internal Server Error")), CachePolicy.NO_STORE);
             }
         }
     }
 
     // ===========================================================
-    //  HANDLER 4 (NEW): GET /users/{id}
-    //
-    //  Demonstrates reading a path parameter extracted by the Router.
-    //  exchange.getAttribute("pathParams") returns the map the Router
-    //  populated when it matched /users/{id} against the request path.
+    //  Router, JwtFilter, Jwt — unchanged from Level 3
     // ===========================================================
 
-    static class UserHandler implements HttpHandler {
+    static class Router implements HttpHandler {
+        private static final Logger log = Logger.getLogger(Router.class.getName());
+        private record Route(String method, Pattern pattern,
+                             List<String> paramNames, HttpHandler handler) {}
+        private final List<Route> routes = new ArrayList<>();
 
-        private static final Logger log = Logger.getLogger(UserHandler.class.getName());
+        void add(String method, String pathTemplate, HttpHandler handler) {
+            List<String> paramNames = new ArrayList<>();
+            String regex = Arrays.stream(pathTemplate.split("/"))
+                    .map(segment -> {
+                        if (segment.startsWith("{") && segment.endsWith("}")) {
+                            paramNames.add(segment.substring(1, segment.length() - 1));
+                            return "([^/]+)";
+                        }
+                        return Pattern.quote(segment);
+                    })
+                    .reduce((a, b) -> a + "/" + b).orElse("");
+            routes.add(new Route(method.toUpperCase(),
+                    Pattern.compile("^" + regex + "$"), paramNames, handler));
+            log.info("Route: " + method.toUpperCase() + " " + pathTemplate);
+        }
 
         @Override
-        @SuppressWarnings("unchecked")
         public void handle(HttpExchange exchange) throws IOException {
-            log.info("GET /users/{id}");
-            try {
-                // Read the path parameter the Router extracted
-                Map<String, String> pathParams =
-                        (Map<String, String>) exchange.getAttribute("pathParams");
-                String userId = pathParams.getOrDefault("id", "unknown");
-
-                // In a real app this is where you'd query a database
-                Map<String, String> response = new HashMap<>();
-                response.put("userId", userId);
-                response.put("note", "Real app would fetch user " + userId + " from a database");
-
-                sendResponse(exchange, 200, "application/json",
-                        GSON.toJson(response), CachePolicy.PRIVATE);
-            } catch (Exception e) {
-                log.log(Level.SEVERE, "Error in UserHandler", e);
-                sendResponse(exchange, 500, "application/json",
-                        GSON.toJson(Map.of("error", "Internal Server Error")),
-                        CachePolicy.NO_STORE);
+            String path   = exchange.getRequestURI().getPath();
+            String method = exchange.getRequestMethod().toUpperCase();
+            boolean pathFound = false;
+            for (Route route : routes) {
+                Matcher m = route.pattern().matcher(path);
+                if (m.matches()) {
+                    pathFound = true;
+                    if (!route.method().equals(method)) continue;
+                    Map<String, String> pp = new HashMap<>();
+                    for (int i = 0; i < route.paramNames().size(); i++)
+                        pp.put(route.paramNames().get(i), m.group(i + 1));
+                    exchange.setAttribute("pathParams", pp);
+                    route.handler().handle(exchange);
+                    return;
+                }
+            }
+            if (pathFound) {
+                sendResponse(exchange, 405, "application/json",
+                        GSON.toJson(Map.of("error", "Method Not Allowed")), CachePolicy.NO_STORE);
+            } else {
+                sendResponse(exchange, 404, "application/json",
+                        GSON.toJson(Map.of("error", "Not Found")), CachePolicy.NO_STORE);
             }
         }
     }
 
+    static class JwtFilter {
+        private static final Logger log = Logger.getLogger(JwtFilter.class.getName());
+        private final String secret;
+        JwtFilter(String secret) { this.secret = secret; }
+
+        HttpHandler wrap(HttpHandler inner) {
+            return exchange -> {
+                String authHeader = exchange.getRequestHeaders().getFirst("Authorization");
+                if (authHeader == null || !authHeader.startsWith("Bearer ")) {
+                    rejectUnauthorized(exchange, "Missing Bearer token"); return;
+                }
+                try {
+                    String username = Jwt.verify(authHeader.substring("Bearer ".length()).trim(), secret);
+                    exchange.setAttribute("authenticatedUser", username);
+                    inner.handle(exchange);
+                } catch (SecurityException e) {
+                    rejectUnauthorized(exchange, e.getMessage());
+                } catch (Exception e) {
+                    rejectUnauthorized(exchange, "Invalid token");
+                }
+            };
+        }
+
+        private void rejectUnauthorized(HttpExchange exchange, String reason) throws IOException {
+            exchange.getResponseHeaders().set("WWW-Authenticate", "Bearer realm=\"SecureApp\"");
+            byte[] body = GSON.toJson(Map.of("error", "Unauthorized", "reason", reason))
+                    .getBytes(StandardCharsets.UTF_8);
+            exchange.sendResponseHeaders(401, body.length);
+            try (OutputStream out = exchange.getResponseBody()) { out.write(body); }
+        }
+    }
+
+    static class Jwt {
+        private static final long EXPIRY_SECONDS = 3600;
+
+        static String issue(String subject, String secret) throws Exception {
+            String header  = b64url("{\"alg\":\"HS256\",\"typ\":\"JWT\"}");
+            String payload = b64url("{\"sub\":\"" + subject + "\","
+                    + "\"exp\":" + (Instant.now().getEpochSecond() + EXPIRY_SECONDS) + "}");
+            String hp = header + "." + payload;
+            return hp + "." + sign(hp, secret);
+        }
+
+        static String verify(String token, String secret) throws Exception {
+            String[] p = token.split("\\.");
+            if (p.length != 3) throw new IllegalArgumentException("Malformed token");
+            if (!MessageDigest.isEqual(sign(p[0] + "." + p[1], secret).getBytes(StandardCharsets.UTF_8),
+                    p[2].getBytes(StandardCharsets.UTF_8)))
+                throw new SecurityException("Invalid token signature");
+            @SuppressWarnings("unchecked")
+            Map<String, Object> claims = GSON.fromJson(
+                    new String(Base64.getUrlDecoder().decode(p[1]), StandardCharsets.UTF_8), Map.class);
+            if (Instant.now().getEpochSecond() > ((Double) claims.get("exp")).longValue())
+                throw new SecurityException("Token has expired");
+            return (String) claims.get("sub");
+        }
+
+        private static String sign(String data, String secret) throws Exception {
+            Mac mac = Mac.getInstance("HmacSHA256");
+            mac.init(new SecretKeySpec(secret.getBytes(StandardCharsets.UTF_8), "HmacSHA256"));
+            return Base64.getUrlEncoder().withoutPadding()
+                    .encodeToString(mac.doFinal(data.getBytes(StandardCharsets.UTF_8)));
+        }
+
+        private static String b64url(String json) {
+            return Base64.getUrlEncoder().withoutPadding()
+                    .encodeToString(json.getBytes(StandardCharsets.UTF_8));
+        }
+    }
+
     // ===========================================================
-    //  Cache Policy Enum (unchanged)
+    //  Cache Policy, shared utilities — unchanged
     // ===========================================================
 
     enum CachePolicy {
-        PUBLIC  ("public, max-age=3600"),
-        PRIVATE ("private, max-age=600"),
-        NO_STORE("no-store");
-
+        PUBLIC("public, max-age=3600"), PRIVATE("private, max-age=600"), NO_STORE("no-store");
         final String headerValue;
-        CachePolicy(String headerValue) { this.headerValue = headerValue; }
+        CachePolicy(String h) { this.headerValue = h; }
     }
-
-    // ===========================================================
-    //  Shared Utilities
-    // ===========================================================
 
     private static String requireEnv(String name) {
-        String value = System.getenv(name);
-        if (value == null || value.isBlank()) {
-            log.severe(name + " environment variable is not set. Refusing to start.");
+        String v = System.getenv(name);
+        if (v == null || v.isBlank()) {
+            log.severe(name + " env var not set. Refusing to start.");
             System.exit(1);
         }
-        return value;
+        return v;
     }
 
-    static void sendResponse(HttpExchange exchange, int status,
-                             String contentType, String body,
-                             CachePolicy cache) throws IOException {
+    static void sendResponse(HttpExchange exchange, int status, String contentType,
+                             String body, CachePolicy cache) throws IOException {
         byte[] bytes = body.getBytes(StandardCharsets.UTF_8);
         exchange.getResponseHeaders().set("Content-Type",  contentType + "; charset=UTF-8");
         exchange.getResponseHeaders().set("Cache-Control", cache.headerValue);
@@ -687,14 +868,28 @@ public class ServerArchitecture {
         for (String param : query.split("&")) {
             String[] parts = param.split("=", 2);
             try {
-                String key   = URLDecoder.decode(parts[0], StandardCharsets.UTF_8);
-                String value = parts.length == 2
-                        ? URLDecoder.decode(parts[1], StandardCharsets.UTF_8) : "";
-                result.put(key, value);
+                result.put(URLDecoder.decode(parts[0], StandardCharsets.UTF_8),
+                        parts.length == 2 ? URLDecoder.decode(parts[1], StandardCharsets.UTF_8) : "");
             } catch (IllegalArgumentException e) {
                 log.warning("Skipping malformed query param: " + parts[0]);
             }
         }
         return result;
+    }
+
+    private static HttpsConfigurator buildHttpsConfigurator(String keystorePass) throws Exception {
+        char[] password = keystorePass.toCharArray();
+        KeyStore ks = KeyStore.getInstance("JKS");
+        try (InputStream in = new FileInputStream("keystore.jks")) { ks.load(in, password); }
+        KeyManagerFactory kmf = KeyManagerFactory.getInstance(KeyManagerFactory.getDefaultAlgorithm());
+        kmf.init(ks, password);
+        SSLContext ssl = SSLContext.getInstance("TLS");
+        ssl.init(kmf.getKeyManagers(), null, null);
+        return new HttpsConfigurator(ssl) {
+            @Override
+            public void configure(HttpsParameters p) {
+                p.setSSLParameters(getSSLContext().getDefaultSSLParameters());
+            }
+        };
     }
 }
