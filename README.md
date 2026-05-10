@@ -1,6 +1,6 @@
 # Java HTTP Server — Built from First Principles
 
-> A production-grade HTTP server built in pure Java with no frameworks — demonstrating authentication, routing, caching, persistence, rate limiting, and containerisation from scratch.
+> A production-style HTTP server built in pure Java with no frameworks — demonstrating authentication, routing, caching, persistence, rate limiting, and containerisation from scratch.
 
 ---
 
